@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.vite/
+.DS_Store
+*.log
+session-history.json
+electron-debug.log
+generated-media/
+.env
+.npm-cache/
+.electron-cache/
+.local-appdata/
