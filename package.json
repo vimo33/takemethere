@@ -5,9 +5,9 @@
   "description": "Internal Take Me There projection prototype: Electron, Three.js, MadMapper output, cloud image generation with fallbacks.",
   "main": "src/main/main.js",
   "scripts": {
-    "dev": "electron -e \"require('./src/main/main.js')\"",
-    "dev:windows": "set LOCALAPPDATA=.local-appdata&& electron -e \"require('./src/main/main.js')\"",
-    "start": "electron -e \"require('./src/main/main.js')\"",
+    "dev": "electron src/main/main.js",
+    "dev:windows": "set LOCALAPPDATA=.local-appdata&& electron src/main/main.js",
+    "start": "electron src/main/main.js",
     "check": "node scripts/check-config.cjs"
   },
   "dependencies": {

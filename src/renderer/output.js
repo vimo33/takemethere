@@ -24,7 +24,7 @@ class WorldView {
     this.name = name;
     this.config = VIEW_CONFIGS[name];
     this.scene = new THREE.Scene();
-    this.scene.fog = new THREE.FogExp2(0x050816, 0.018);
+    this.scene.fog = new THREE.FogExp2(0x000000, 0.003);
     this.camera = new THREE.PerspectiveCamera(this.config.fov, 1, 0.1, 1000);
     this.camera.position.set(0, 0, 0.1);
     this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance' });
@@ -83,21 +83,20 @@ class WorldView {
 
   setPalette(palette) {
     currentPalette = palette;
-    this.scene.fog.color = new THREE.Color(palette[0]);
     this.colorWash.material.color = new THREE.Color(palette[1]);
   }
 
   render(elapsed) {
     const stateEnergy = getStateEnergy(currentStateKey);
-    const yaw = this.config.yaw + Math.sin(elapsed * 0.032) * stateEnergy * 0.09;
-    const pitch = this.config.pitch + Math.cos(elapsed * 0.027) * stateEnergy * 0.03;
-    this.world.rotation.y = Math.sin(elapsed * 0.035) * 0.045 + elapsed * 0.006;
-    this.world.rotation.x = Math.sin(elapsed * 0.026) * 0.012;
+    // Single shared pan: all views rotate together so content flows right → front → left
+    this.world.rotation.y = elapsed * 0.006;
     this.particles.rotation.y = elapsed * (0.012 + stateEnergy * 0.01);
     this.particles.rotation.x = Math.sin(elapsed * 0.04) * 0.07;
     this.particles.material.opacity = 0.22 + stateEnergy * 0.34;
     this.colorWash.material.opacity = 0.025 + stateEnergy * 0.075;
-    this.camera.lookAt(new THREE.Vector3(Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), -Math.cos(yaw) * Math.cos(pitch)));
+    // Camera stays locked to its wall angle with only a very subtle vertical breathe
+    const pitch = this.config.pitch + Math.sin(elapsed * 0.009) * 0.008;
+    this.camera.lookAt(new THREE.Vector3(Math.sin(this.config.yaw) * Math.cos(pitch), Math.sin(pitch), -Math.cos(this.config.yaw) * Math.cos(pitch)));
     this.renderer.render(this.scene, this.camera);
   }
 
@@ -117,12 +116,17 @@ function setupViews(layoutMode = 'three-wall') {
 function loadTexture(imageDataUrl, force = false) {
   if (!imageDataUrl || (!force && imageDataUrl === currentImage)) return;
   currentImage = imageDataUrl;
-  new THREE.TextureLoader().load(imageDataUrl, (texture) => {
-    texture.colorSpace = THREE.SRGBColorSpace;
-    texture.wrapS = THREE.RepeatWrapping;
-    texture.wrapT = THREE.ClampToEdgeWrapping;
-    for (const view of views) view.setTexture(texture.clone());
-  });
+  new THREE.TextureLoader().load(
+    imageDataUrl,
+    (texture) => {
+      texture.colorSpace = THREE.SRGBColorSpace;
+      texture.wrapS = THREE.RepeatWrapping;
+      texture.wrapT = THREE.ClampToEdgeWrapping;
+      for (const view of views) view.setTexture(texture.clone());
+    },
+    undefined,
+    (err) => console.error('[takemethere] texture load failed', err)
+  );
 }
 
 function createDefaultTexture(palette) {

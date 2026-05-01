@@ -2,7 +2,7 @@ const { createFallbackRecipe, normalizeRecipe } = require('./world-recipe.cjs');
 
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 const PROMPT_MODEL = process.env.GEMINI_PROMPT_MODEL || 'gemini-2.5-flash';
-const IMAGE_MODEL = process.env.GEMINI_IMAGE_MODEL || 'gemini-2.5-flash-image';
+const IMAGE_MODEL = process.env.GEMINI_IMAGE_MODEL || 'imagen-4.0-generate-001';
 const OPENAI_IMAGE_MODEL = process.env.OPENAI_IMAGE_MODEL || 'gpt-image-1.5';
 const GENERATION_TIMEOUT_MS = Number(process.env.GENERATION_TIMEOUT_MS || 60000);
 
@@ -47,12 +47,24 @@ async function expandPrompt(visitorInput) {
   }
 
   const started = Date.now();
-  const instruction = `You are the hidden world dramaturg for the installation "Take Me There".
-Transform the visitor input into strict JSON only. Preserve their intent but make it projection-friendly and public-safe.
-Rules: immersive spatial environment, no text/logos, no recognizable people, no copyrighted characters, no sexual content, no gore, no violence, calm slow movement, emphasize material, atmosphere, light, and depth.
-Return keys exactly: title, visitor_input, visual_prompt, negative_prompt, mood, palette, motion_style, sound_style, lighting_style, safety_level.
+  const instruction = `You are the world-builder for the installation "Take Me There". A visitor has described a world they want to be transported to. Your job is to make that world as literal and vivid as possible.
+
+CRITICAL RULE: Keep every specific creature, place, material, and phenomenon the visitor mentioned. If they said "glowing birds", there must be glowing birds — not abstract light streaks. If they said "underwater", it must look like being underwater. Never replace literal elements with abstract equivalents. Never sanitize away the things that make their world unique.
+
+Safety rules only (no exceptions): no recognizable real people, no copyrighted characters, no sexual content, no gore, no violence, no text or logos.
+
+The visual_prompt MUST be a single dense paragraph of 80-120 words describing a PANORAMIC EYE-LEVEL VIEW — as if a person is standing inside this world looking straight ahead. The horizon must be at eye level. The scene extends left and right as one continuous environment. Structure it as:
+- FOREGROUND: textured ground/floor elements close to the viewer (left AND right sides)
+- MIDGROUND: the main environment with the visitor's specific creatures/elements visible across the full width
+- BACKGROUND: vast horizon, sky, distant structures or terrain
+- LIGHTING: exact light sources — from above or from the horizon
+- ATMOSPHERE: particles floating in the air throughout the scene
+
+NEVER describe a top-down, aerial, or macro close-up view. This must read as if you are STANDING INSIDE the world, looking at the horizon.
+
+Return JSON with keys: title, visitor_input, visual_prompt, negative_prompt, mood, palette, motion_style, sound_style, lighting_style, safety_level.
 sound_style must be one of: aquatic, cosmic, forest, glass, desert, cathedral, dream, mechanical, strange.
-palette must contain 4 CSS hex colors.
+palette must contain 4 CSS hex colors that match the literal world described.
 Visitor input: "${visitorInput}"`;
 
   const result = await withTimeout(
@@ -66,6 +78,45 @@ Visitor input: "${visitorInput}"`;
   return { recipe, provider: PROMPT_MODEL, latencyMs: Date.now() - started };
 }
 
+async function generateImagenImage(recipe) {
+  const key = process.env.GEMINI_API_KEY;
+  const started = Date.now();
+  const prompt = `${recipe.visual_prompt}
+
+Mood: ${recipe.mood}. Colors: ${recipe.palette.join(', ')}.
+
+Style: photorealistic cinematic photography. Shot on RED camera with anamorphic lens. Perfect exposure, physically accurate lighting, subsurface scattering on organic surfaces, volumetric god rays, bokeh depth of field. Every texture ultra-sharp and tangible. This image will be projected floor-to-ceiling across three walls surrounding a person — it must be indistinguishable from reality.
+
+Requirements: deep blacks, vivid saturated light sources, visible atmospheric particles (bubbles/spores/mist/embers), strong foreground-midground-background depth layers, no people, no text, no logos.`;
+
+  const response = await fetch(`${GEMINI_BASE}/models/${IMAGE_MODEL}:predict`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+    body: JSON.stringify({
+      instances: [{ prompt }],
+      parameters: { numberOfImages: 1, aspectRatio: '16:9', personGeneration: 'dont_allow' }
+    })
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Imagen failed: ${response.status} ${body}`);
+  }
+
+  const json = await response.json();
+  const prediction = json.predictions?.[0];
+  const b64 = prediction?.bytesBase64Encoded;
+  const mime = prediction?.mimeType || 'image/png';
+  if (!b64) throw new Error(`Imagen did not return image data. Keys: ${JSON.stringify(Object.keys(json))}`);
+
+  return {
+    imageDataUrl: `data:${mime};base64,${b64}`,
+    provider: IMAGE_MODEL,
+    latencyMs: Date.now() - started,
+    estimatedCostUsd: 0.04
+  };
+}
+
 async function generateImage(recipe) {
   const imageProvider = (process.env.IMAGE_PROVIDER || 'gemini').toLowerCase();
 
@@ -75,11 +126,30 @@ async function generateImage(recipe) {
     return { imageDataUrl: createSvgDataUrl(recipe), provider: 'local-svg-fallback', latencyMs: 0, estimatedCostUsd: 0 };
   }
 
+  if (IMAGE_MODEL.startsWith('imagen-')) return generateImagenImage(recipe);
+
   const started = Date.now();
-  const prompt = `${recipe.visual_prompt}\n\nMood: ${recipe.mood}\nPalette: ${recipe.palette.join(', ')}\nGenerate a wide 16:9 immersive environment texture suitable for mapping across front, left, and right walls.`;
+  const prompt = `${recipe.visual_prompt}
+
+Mood: ${recipe.mood}
+Dominant colors: ${recipe.palette.join(', ')}
+
+Style: ultra-detailed concept art for a live immersive projection installation. This image will be projected floor-to-ceiling across three walls surrounding a person — it must feel like they have been physically transported to another world.
+
+CRITICAL COMPOSITION RULES — this image will be split across three physical projection walls surrounding a standing person:
+- CAMERA: eye-level, standing height, looking straight at the horizon. NOT aerial. NOT top-down. NOT macro close-up.
+- HORIZON: clearly visible, at the vertical center of the image, with sky above and ground below
+- PANORAMIC: the left edge, center, and right edge must all show different parts of the SAME continuous environment — like a 180° wide-angle photograph taken from one spot
+- DEPTH: strong layering — textured ground in the foreground, environment in midground, vast distance in background
+- SCALE: towering structures, huge geological forms, or enormous organic growth that make the viewer feel small
+- LIGHT: dramatic light sources — sun/moon on the horizon, volumetric rays, glowing elements, deep shadows
+- ATMOSPHERE: visible particles throughout — floating spores, mist, embers, bubbles, bioluminescent drift
+- DETAIL: every surface rich with texture — no empty voids, no blank sky, no plain flat ground
+- No people, no text, no logos
+- Photorealistic, cinematic, 16:9`;
 
   const result = await withTimeout(
-    geminiGenerateContent(IMAGE_MODEL, [{ role: 'user', parts: [{ text: prompt }] }]),
+    geminiGenerateContent(IMAGE_MODEL, [{ role: 'user', parts: [{ text: prompt }] }], { responseModalities: ['Image'] }),
     GENERATION_TIMEOUT_MS,
     'Image generation'
   );
