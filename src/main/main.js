@@ -99,6 +99,22 @@ function setState(key, extras = {}) {
   broadcastSession();
 }
 
+function saveGeneratedImage(imageDataUrl, recipe) {
+  try {
+    const dir = path.join(__dirname, '../../generated-worlds');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const base64 = imageDataUrl.replace(/^data:image\/\w+;base64,/, '');
+    const ext = imageDataUrl.startsWith('data:image/png') ? 'png' : 'jpg';
+    const slug = (recipe?.title || 'world').toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40);
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const filename = `${ts}-${slug}.${ext}`;
+    fs.writeFileSync(path.join(dir, filename), Buffer.from(base64, 'base64'));
+    debugLog(`image saved: ${filename}`);
+  } catch (error) {
+    debugLog('saveGeneratedImage failed', error);
+  }
+}
+
 function writeSessionHistory(eventName) {
   const record = {
     at: new Date().toISOString(),
@@ -154,6 +170,7 @@ async function generateWorld(visitorInput) {
     session.provider.image = image.provider;
     session.timings.imageMs = image.latencyMs;
     session.costEstimateUsd += image.estimatedCostUsd || 0;
+    saveGeneratedImage(image.imageDataUrl, session.recipe);
     writeSessionHistory('world_generated');
     setState('PORTAL_OPENING');
     setTimeout(() => setState('ARRIVAL'), 3500);

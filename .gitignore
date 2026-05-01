@@ -6,6 +6,8 @@ dist/
 session-history.json
 electron-debug.log
 generated-media/
+generated-worlds/
+.superpowers/
 .env
 .npm-cache/
 .electron-cache/
