@@ -12,3 +12,6 @@ generated-worlds/
 .npm-cache/
 .electron-cache/
 .local-appdata/
+tools/
+gemini-response.json
+gemini-test.json

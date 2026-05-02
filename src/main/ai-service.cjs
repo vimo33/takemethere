@@ -1,10 +1,16 @@
 const { createFallbackRecipe, normalizeRecipe } = require('./world-recipe.cjs');
 
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta';
-const PROMPT_MODEL = process.env.GEMINI_PROMPT_MODEL || 'gemini-2.5-flash';
+const PROMPT_MODEL = process.env.GEMINI_PROMPT_MODEL || 'gemini-3-flash-preview';
 const IMAGE_MODEL = process.env.GEMINI_IMAGE_MODEL || 'imagen-4.0-generate-001';
-const OPENAI_IMAGE_MODEL = process.env.OPENAI_IMAGE_MODEL || 'gpt-image-1.5';
+const OPENAI_IMAGE_MODEL = process.env.OPENAI_IMAGE_MODEL || 'gpt-image-2';
+const OPENAI_IMAGE_SIZE = process.env.OPENAI_IMAGE_SIZE || '1536x1024';
+const OPENAI_IMAGE_QUALITY = process.env.OPENAI_IMAGE_QUALITY || 'medium';
+const OPENAI_IMAGE_FORMAT = process.env.OPENAI_IMAGE_FORMAT || 'jpeg';
+const WORLD_IMAGE_MODE = (process.env.WORLD_IMAGE_MODE || 'projection').toLowerCase();
 const GENERATION_TIMEOUT_MS = Number(process.env.GENERATION_TIMEOUT_MS || 60000);
+const GEMINI_NETWORK_HELP = 'Could not reach Google Gemini API. Check internet/firewall/proxy access to generativelanguage.googleapis.com:443.';
+const OPENAI_NETWORK_HELP = 'Could not reach OpenAI API. Check internet/firewall/proxy access to api.openai.com:443.';
 
 function withTimeout(promise, timeoutMs, label) {
   let timeout;
@@ -27,11 +33,16 @@ async function geminiGenerateContent(model, contents, generationConfig = {}) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error('GEMINI_API_KEY is not configured');
 
-  const response = await fetch(`${GEMINI_BASE}/models/${model}:generateContent?key=${key}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ contents, generationConfig })
-  });
+  let response;
+  try {
+    response = await fetch(`${GEMINI_BASE}/models/${model}:generateContent?key=${key}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contents, generationConfig })
+    });
+  } catch (error) {
+    throw new Error(`${GEMINI_NETWORK_HELP} ${error.message}`);
+  }
 
   if (!response.ok) {
     const body = await response.text();
@@ -68,12 +79,12 @@ palette must contain 4 CSS hex colors that match the literal world described.
 Visitor input: "${visitorInput}"`;
 
   const result = await withTimeout(
-    geminiGenerateContent(PROMPT_MODEL, [{ role: 'user', parts: [{ text: instruction }] }], { responseMimeType: 'application/json' }),
+    geminiGenerateContent(PROMPT_MODEL, [{ role: 'user', parts: [{ text: instruction }] }], { response_mime_type: 'application/json', responseMimeType: 'application/json' }),
     15000,
     'Prompt expansion'
   );
 
-  const text = result.candidates?.[0]?.content?.parts?.map((part) => part.text || '').join('\n') || '{}';
+  const text = result.candidates?.[0]?.content?.parts?.filter((part) => typeof part.text === 'string').map((part) => part.text).join('\n') || '{}';
   const recipe = normalizeRecipe(extractJson(text), visitorInput);
   return { recipe, provider: PROMPT_MODEL, latencyMs: Date.now() - started };
 }
@@ -89,14 +100,19 @@ Style: photorealistic cinematic photography. Shot on RED camera with anamorphic 
 
 Requirements: deep blacks, vivid saturated light sources, visible atmospheric particles (bubbles/spores/mist/embers), strong foreground-midground-background depth layers, no people, no text, no logos.`;
 
-  const response = await fetch(`${GEMINI_BASE}/models/${IMAGE_MODEL}:predict`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-    body: JSON.stringify({
-      instances: [{ prompt }],
-      parameters: { numberOfImages: 1, aspectRatio: '16:9', personGeneration: 'dont_allow' }
-    })
-  });
+  let response;
+  try {
+    response = await fetch(`${GEMINI_BASE}/models/${IMAGE_MODEL}:predict`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+      body: JSON.stringify({
+        instances: [{ prompt }],
+        parameters: { numberOfImages: 1, aspectRatio: '16:9', personGeneration: 'dont_allow' }
+      })
+    });
+  } catch (error) {
+    throw new Error(`${GEMINI_NETWORK_HELP} ${error.message}`);
+  }
 
   if (!response.ok) {
     const body = await response.text();
@@ -113,7 +129,7 @@ Requirements: deep blacks, vivid saturated light sources, visible atmospheric pa
     imageDataUrl: `data:${mime};base64,${b64}`,
     provider: IMAGE_MODEL,
     latencyMs: Date.now() - started,
-    estimatedCostUsd: 0.04
+    estimatedCostUsd: estimateImagenCost(IMAGE_MODEL)
   };
 }
 
@@ -163,30 +179,86 @@ CRITICAL COMPOSITION RULES — this image will be split across three physical pr
     imageDataUrl: `data:${inline.mimeType || inline.mime_type || 'image/png'};base64,${inline.data}`,
     provider: IMAGE_MODEL,
     latencyMs: Date.now() - started,
-    estimatedCostUsd: 0.1
+    estimatedCostUsd: 0.08
   };
 }
 
 async function generateOpenAiImage(recipe) {
   const started = Date.now();
-  const prompt = `${recipe.visual_prompt}\n\nMood: ${recipe.mood}\nPalette: ${recipe.palette.join(', ')}\nCreate a wide immersive environment image for projection mapping. No text, no logos, no people.`;
+  const prompt = buildOpenAiImagePrompt(recipe);
 
-  const response = await withTimeout(
-    fetch('https://api.openai.com/v1/images/generations', {
+  let response;
+  try {
+    response = await withTimeout(
+      fetch('https://api.openai.com/v1/images/generations', {
       method: 'POST',
       headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: OPENAI_IMAGE_MODEL, prompt, size: '1536x1024', quality: 'medium', response_format: 'b64_json' })
-    }),
-    GENERATION_TIMEOUT_MS,
-    'OpenAI image generation'
-  );
+        body: JSON.stringify({
+          model: OPENAI_IMAGE_MODEL,
+          prompt,
+          size: OPENAI_IMAGE_SIZE,
+          quality: OPENAI_IMAGE_QUALITY,
+          output_format: OPENAI_IMAGE_FORMAT,
+          moderation: 'auto'
+        })
+      }),
+      GENERATION_TIMEOUT_MS,
+      'OpenAI image generation'
+    );
+  } catch (error) {
+    throw new Error(`${OPENAI_NETWORK_HELP} ${error.message}`);
+  }
 
   if (!response.ok) throw new Error(`OpenAI image generation failed: ${response.status} ${await response.text()}`);
   const json = await response.json();
   const image = json.data?.[0]?.b64_json;
   if (!image) throw new Error('OpenAI image model did not return b64_json image data');
 
-  return { imageDataUrl: `data:image/png;base64,${image}`, provider: OPENAI_IMAGE_MODEL, latencyMs: Date.now() - started, estimatedCostUsd: 0.05 };
+  return {
+    imageDataUrl: `data:image/${OPENAI_IMAGE_FORMAT};base64,${image}`,
+    provider: OPENAI_IMAGE_MODEL,
+    latencyMs: Date.now() - started,
+    estimatedCostUsd: estimateOpenAiImageCost(OPENAI_IMAGE_MODEL, OPENAI_IMAGE_SIZE, OPENAI_IMAGE_QUALITY)
+  };
+}
+
+function buildOpenAiImagePrompt(recipe) {
+  if (WORLD_IMAGE_MODE === 'equirectangular') {
+    return `${recipe.visual_prompt}
+
+Mood: ${recipe.mood}
+Palette: ${recipe.palette.join(', ')}
+
+Generate a seamless 360-degree equirectangular panorama image for a VR/panorama viewer.
+The output must be a true 2:1 equirectangular projection viewed from the exact center of the world.
+The left and right edges must connect seamlessly with matching lighting, geometry, horizon, and atmosphere.
+Keep the horizon at the vertical center. Avoid close objects crossing the left/right seam.
+Avoid important details at the top and bottom poles because they will distort on a sphere.
+Design the environment as a continuous circular world surrounding the viewer, not a flat wide-angle photograph.
+No people, no faces, no text, no logos, no watermarks.`;
+  }
+
+  return `${recipe.visual_prompt}\n\nMood: ${recipe.mood}\nPalette: ${recipe.palette.join(', ')}\nCreate a wide immersive environment image for projection mapping. No text, no logos, no people.`;
+}
+
+function estimateImagenCost(model) {
+  if (model.includes('fast')) return 0.02;
+  if (model.includes('ultra')) return 0.06;
+  return 0.04;
+}
+
+function estimateOpenAiImageCost(model, size, quality) {
+  if (model === 'gpt-image-2') {
+    if (quality === 'low') return size === '1024x1024' ? 0.011 : 0.016;
+    if (quality === 'high') return size === '1024x1024' ? 0.166 : 0.25;
+    return size === '1024x1024' ? 0.041 : 0.063;
+  }
+  if (model === 'gpt-image-1.5') {
+    if (quality === 'low') return size === '1024x1024' ? 0.009 : 0.013;
+    if (quality === 'high') return size === '1024x1024' ? 0.133 : 0.2;
+    return size === '1024x1024' ? 0.034 : 0.05;
+  }
+  return 0.05;
 }
 
 function createSvgDataUrl(recipe) {

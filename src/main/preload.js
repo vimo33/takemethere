@@ -6,6 +6,8 @@ contextBridge.exposeInMainWorld('takeMeThere', {
   generateWorld: (prompt) => ipcRenderer.invoke('session:generate-world', prompt),
   fallbackWorld: (prompt) => ipcRenderer.invoke('session:fallback-world', prompt),
   setLayout: (layout) => ipcRenderer.invoke('session:set-layout', layout),
+  setVisualMode: (mode) => ipcRenderer.invoke('session:set-visual-mode', mode),
+  setProjectorConfig: (config) => ipcRenderer.invoke('session:set-projector-config', config),
   toggleOutputFullscreen: () => ipcRenderer.invoke('window:output-fullscreen'),
   focusOutput: () => ipcRenderer.invoke('window:focus-output'),
   reloadOutput: () => ipcRenderer.invoke('window:reload-output'),
