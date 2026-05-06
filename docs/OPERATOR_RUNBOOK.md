@@ -5,9 +5,10 @@
 1. Connect projector outputs.
 2. Open MadMapper and load the room preset.
 3. Start the app with `npm run dev`.
-4. Move the projection output window to the projector display.
-5. Trigger fullscreen output from the operator dashboard.
-6. Run one fallback world before using cloud generation.
+4. Confirm the left, front, and right frame windows are open.
+5. Start the Spout capture senders for those three frame windows.
+6. Confirm MadMapper receives `TakeMeThere_LEFT`, `TakeMeThere_FRONT`, and `TakeMeThere_RIGHT`.
+7. Run one fallback world before using cloud generation.
 
 ## Session Flow
 

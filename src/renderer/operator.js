@@ -94,9 +94,12 @@ function startAudioBars() {
 function renderTopbar() {
   const state = session?.state || {};
   const settings = session?.sceneSettings || {};
+  const ndi = session?.ndi || {};
   const projectors = normalizeProjectors(session?.projectors, session?.layoutMode);
   const liveCount = projectors.filter((projector) => projector.live).length;
   const wallTime = new Date().toLocaleTimeString('en-GB');
+  const ndiSignal = ndi.running ? 'green' : ndi.helperExists ? 'amber' : 'red';
+  const ndiLabel = ndi.running ? 'NDI LIVE' : ndi.helperExists ? 'NDI READY' : 'NDI MISSING';
   topbar.innerHTML = `
     <div class="brand">
       <div class="brand-mark"></div>
@@ -116,6 +119,7 @@ function renderTopbar() {
       <div class="tape-cell"><span class="label">Prompt Provider</span><span class="value">${escapeHtml(session?.provider?.prompt || 'local')}</span></div>
       <div class="tape-cell"><span class="label">Image Provider</span><span class="value">${escapeHtml(session?.provider?.image || 'local')}</span></div>
       <div class="tape-cell signal-green"><span class="label">Output</span><span class="value"><span class="led green" style="margin-right:6px"></span>${liveCount}/${projectors.length} LIVE</span></div>
+      <div class="tape-cell signal-${ndiSignal}"><span class="label">Transport</span><span class="value"><span class="led ${ndiSignal}" style="margin-right:6px"></span>${ndiLabel}</span></div>
       <div class="tape-cell signal-violet"><span class="label">Mode</span><span class="value">${escapeHtml(settings.worldMode || 'single').toUpperCase()}</span></div>
     </div>
     <div class="topbar-right">
@@ -145,6 +149,7 @@ function getRenderSignature() {
     (session?.generatedWorlds || []).map((world) => world.name).join('|'),
     session?.config?.hasGemini ? 'gemini' : 'no-gemini',
     session?.config?.hasOpenAI ? 'openai' : 'no-openai',
+    session?.ndi?.running ? 'ndi-running' : `ndi-${session?.ndi?.error || 'idle'}`,
     session?.sceneBuilder?.selectedCameraId || '',
     session?.sceneBuilder?.depthMode || 'single',
     JSON.stringify(session?.outputMappings || {}),

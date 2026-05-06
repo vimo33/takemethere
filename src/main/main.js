@@ -7,9 +7,14 @@ const { createFallbackRecipe } = require('./world-recipe.cjs');
 loadLocalEnv();
 
 const { expandPrompt, generateImage, createSvgDataUrl } = require('./ai-service.cjs');
+const madMapper = require('./madmapper-control.cjs');
+const ndiManager = require('./ndi-manager.cjs');
 
 let operatorWindow;
 let outputWindow;
+let ndiSourceWindows = [];
+let ndiAutoStart = true;
+let ndiFeedSignature = '';
 let transitionToken = 0;
 let transitionTimers = [];
 
@@ -140,6 +145,44 @@ function syncProjectorsFromSceneBuilder() {
   });
 }
 
+function slotFeedName(slot) {
+  return `TakeMeThere_${String(slot || 'output').toUpperCase()}`;
+}
+
+function activeNdiFeeds() {
+  const slots = session.layoutMode === 'ceiling'
+    ? OUTPUT_SLOTS
+    : OUTPUT_SLOTS.filter((slotInfo) => slotInfo.slot !== 'ceiling');
+  return slots.map((slotInfo, index) => {
+    const cameraId = session.outputMappings?.[slotInfo.slot];
+    const camera = session.sceneBuilder?.cameras?.find((item) => item.id === cameraId);
+    const orientation = camera?.orientation === 'portrait' ? 'portrait' : 'landscape';
+    const resolution = orientation === 'portrait'
+      ? { width: 1080, height: 1920 }
+      : { width: 1920, height: 1080 };
+    return {
+      id: slotInfo.slot,
+      name: slotFeedName(slotInfo.slot),
+      label: camera?.label || slotInfo.label,
+      role: 'projector',
+      orientation,
+      resolution,
+      surface: `Quad-${index + 1}`
+    };
+  });
+}
+
+function syncNdiHelper() {
+  const feeds = activeNdiFeeds();
+  const signature = feeds.map((feed) => `${feed.id}:${feed.name}:${feed.resolution.width}x${feed.resolution.height}`).join('|');
+  if (!ndiAutoStart) return;
+  const status = ndiManager.getStatus();
+  if (signature !== ndiFeedSignature || (!status.running && !status.error)) {
+    ndiFeedSignature = signature;
+    ndiManager.start(feeds);
+  }
+}
+
 function nextSceneCameraId() {
   let index = session.sceneBuilder.cameras.length + 1;
   const ids = new Set(session.sceneBuilder.cameras.map((camera) => camera.id));
@@ -232,6 +275,8 @@ function createWindows() {
 
   operatorWindow.loadFile(path.join(__dirname, '../../index.html'));
   outputWindow.loadFile(path.join(__dirname, '../../output.html'));
+  syncNdiSourceWindows();
+  syncNdiHelper();
 
   for (const [name, win] of [['operator', operatorWindow], ['output', outputWindow]]) {
     win.webContents.on('console-message', (event) => {
@@ -257,9 +302,90 @@ function createWindows() {
 
   operatorWindow.on('closed', () => {
     operatorWindow = null;
+    for (const win of [...ndiSourceWindows]) {
+      if (!win.isDestroyed()) win.close();
+    }
   });
   outputWindow.on('closed', () => {
     outputWindow = null;
+  });
+}
+
+function createNdiSourceWindow(feed, index) {
+  const width = feed.resolution?.width || 1920;
+  const height = feed.resolution?.height || 1080;
+  const win = new BrowserWindow({
+    x: -32000 + index * 8,
+    y: -32000 + index * 8,
+    width,
+    height,
+    title: feed.name,
+    backgroundColor: '#000000',
+    resizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    autoHideMenuBar: true,
+    useContentSize: true,
+    show: false,
+    skipTaskbar: true,
+    focusable: false,
+    paintWhenInitiallyHidden: true,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  });
+  win.__feedId = feed.id;
+  win.__feedName = feed.name;
+  win.loadFile(path.join(__dirname, '../../output.html'), {
+    query: { slot: feed.id, feedId: feed.id, ndi: '1' }
+  });
+  win.on('ready-to-show', () => {
+    win.showInactive();
+    if (!win.__ndiSubscribed) {
+      try {
+        win.webContents.beginFrameSubscription(false, (image) => {
+          if (image.isEmpty()) return;
+          const size = image.getSize();
+          const bitmap = image.getBitmap();
+          if (!bitmap || !size.width || !size.height) return;
+          ndiManager.sendFrame(feed.name, bitmap, size.width, size.height);
+        });
+        win.__ndiSubscribed = true;
+      } catch (error) {
+        debugLog(`ndi frame subscription failed for ${feed.id}`, error);
+      }
+    }
+  });
+  win.webContents.on('did-finish-load', () => debugLog(`ndi source ${feed.name} did-finish-load`));
+  win.webContents.on('did-fail-load', (_event, code, description, url) => {
+    debugLog(`ndi source ${feed.name} did-fail-load ${code} ${description} ${url}`);
+  });
+  win.webContents.on('console-message', (event) => {
+    debugLog(`ndi ${feed.id} console[${event.level}] ${event.message} (${event.sourceId}:${event.lineNumber})`);
+  });
+  win.on('closed', () => {
+    try { win.webContents.endFrameSubscription(); } catch (_err) { /* window already closed */ }
+    ndiSourceWindows = ndiSourceWindows.filter((sourceWindow) => sourceWindow !== win);
+  });
+  ndiSourceWindows.push(win);
+  return win;
+}
+
+function syncNdiSourceWindows() {
+  if (!operatorWindow) return;
+  const feeds = activeNdiFeeds();
+  const ids = new Set(feeds.map((feed) => feed.id));
+  for (const win of [...ndiSourceWindows]) {
+    if (!ids.has(win.__feedId) || win.isDestroyed()) {
+      if (!win.isDestroyed()) win.close();
+      ndiSourceWindows = ndiSourceWindows.filter((sourceWindow) => sourceWindow !== win);
+    }
+  }
+  const existing = new Map(ndiSourceWindows.filter((win) => !win.isDestroyed()).map((win) => [win.__feedId, win]));
+  feeds.forEach((feed, index) => {
+    if (!existing.has(feed.id)) createNdiSourceWindow(feed, index);
   });
 }
 
@@ -332,9 +458,14 @@ async function runSmokeCheck() {
 }
 
 function broadcastSession() {
+  syncNdiSourceWindows();
+  syncNdiHelper();
   const payload = serializeSession();
   operatorWindow?.webContents.send('session:update', payload);
   outputWindow?.webContents.send('session:update', payload);
+  for (const win of ndiSourceWindows) {
+    if (!win.isDestroyed()) win.webContents.send('session:update', payload);
+  }
 }
 
 function serializeSession() {
@@ -349,6 +480,7 @@ function serializeSession() {
     },
     outputMappings: { ...session.outputMappings },
     sceneSettings: { ...session.sceneSettings },
+    ndi: ndiManager.getStatus(),
     history: session.history.slice(0, 12),
     generatedWorlds: listGeneratedWorlds().slice(0, 24),
     config: {
@@ -780,6 +912,47 @@ ipcMain.handle('session:apply-preset', (_event, preset) => {
   return serializeSession();
 });
 
+ipcMain.handle('ndi:start', () => {
+  ndiAutoStart = true;
+  syncNdiSourceWindows();
+  ndiManager.start(activeNdiFeeds());
+  broadcastSession();
+  return ndiManager.getStatus();
+});
+
+ipcMain.handle('ndi:stop', () => {
+  ndiAutoStart = false;
+  ndiManager.stop();
+  broadcastSession();
+  return ndiManager.getStatus();
+});
+
+ipcMain.handle('ndi:status', () => ndiManager.getStatus());
+
+ipcMain.handle('madmapper:discover', async (_event, config = {}) => madMapper.discover(config));
+ipcMain.handle('madmapper:send', async (_event, pathName, value, config = {}) => madMapper.send(pathName, value, config));
+ipcMain.handle('madmapper:trigger', async (_event, pathName, config = {}) => madMapper.trigger(pathName, config));
+ipcMain.handle('madmapper:get-value', async (_event, pathName, config = {}) => madMapper.getValue(pathName, config));
+ipcMain.handle('madmapper:validate-outputs', async (_event, config = {}) => {
+  const discovery = await madMapper.discover(config);
+  const mediaNames = new Set((discovery.media || []).map((item) => String(item.name || '').toLowerCase()));
+  const surfaceNames = new Set((discovery.surfaces || []).map((item) => String(item.name || '').toLowerCase()));
+  const checks = activeNdiFeeds().map((feed) => {
+    const surface = feed.surface || '';
+    return {
+      name: feed.name,
+      mediaFound: mediaNames.has(String(feed.name).toLowerCase()),
+      surface,
+      surfaceFound: !surface || surfaceNames.has(surface.toLowerCase())
+    };
+  });
+  return {
+    ok: checks.every((check) => check.mediaFound && check.surfaceFound),
+    checks,
+    discovery
+  };
+});
+
 ipcMain.handle('window:output-fullscreen', () => {
   outputWindow?.setFullScreen(!outputWindow.isFullScreen());
   return outputWindow?.isFullScreen() || false;
@@ -810,5 +983,9 @@ app.whenReady().then(() => {
 });
 
 app.on('window-all-closed', () => {
+  ndiManager.stop();
+  for (const win of [...ndiSourceWindows]) {
+    if (!win.isDestroyed()) win.close();
+  }
   if (process.platform !== 'darwin') app.quit();
 });

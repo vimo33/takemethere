@@ -644,6 +644,7 @@ export class SphereWorldRenderer {
     this.camera.position.set(projector.offX || 0, projector.offY || 0, projector.offZ || 0);
     this.camera.rotation.y = projector.yaw || 0;
     this.camera.rotation.x = projector.pitch || 0;
+    this.camera.rotation.z = projector.orientation === 'portrait' ? Math.PI / 2 : 0;
     this.camera.fov = projector.fov || 75;
     this.camera.layers.set(LAYER_WORLD);
     this.camera.updateProjectionMatrix();
@@ -656,6 +657,7 @@ export class SphereWorldRenderer {
     object.camera.position.set(projector.offX || 0, projector.offY || 0, projector.offZ || 0);
     object.camera.rotation.y = projector.yaw || 0;
     object.camera.rotation.x = projector.pitch || 0;
+    object.camera.rotation.z = projector.orientation === 'portrait' ? Math.PI / 2 : 0;
     object.camera.fov = projector.fov || 75;
     object.camera.aspect = projector.orientation === 'portrait' ? 9 / 16 : 16 / 9;
     object.camera.updateProjectionMatrix();
@@ -1087,6 +1089,7 @@ export class SphereWorldSceneBuilder {
       monitor.cam.position.set(camera.offX || 0, camera.offY || 0, camera.offZ || 0);
       monitor.cam.rotation.y = camera.yaw || 0;
       monitor.cam.rotation.x = camera.pitch || 0;
+      monitor.cam.rotation.z = camera.orientation === 'portrait' ? Math.PI / 2 : 0;
     }
     monitor.cam.fov = camera.fov || 60;
     monitor.cam.aspect = camera.orientation === 'portrait' ? 9 / 16 : 16 / 9;
@@ -1315,6 +1318,7 @@ export class SphereWorldOutputRenderer {
       camera.position.set(projector.offX || 0, projector.offY || 0, projector.offZ || 0);
       camera.rotation.y = projector.yaw || 0;
       camera.rotation.x = projector.pitch || 0;
+      camera.rotation.z = projector.orientation === 'portrait' ? Math.PI / 2 : 0;
       camera.fov = projector.fov || 75;
       camera.aspect = cellW / this.height;
       camera.updateProjectionMatrix();

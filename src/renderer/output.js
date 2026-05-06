@@ -2,8 +2,11 @@ import { SphereWorldOutputRenderer, normalizeSceneCameras } from './scene-engine
 
 const api = window.takeMeThere;
 const root = document.querySelector('#output-app');
+const params = new URLSearchParams(window.location.search);
+const requestedSlot = ['left', 'front', 'right', 'ceiling'].includes(params.get('slot')) ? params.get('slot') : '';
+const isNdiSource = params.get('ndi') === '1';
 root.innerHTML = `
-  <main class="output-shell">
+  <main class="output-shell${isNdiSource ? ' ndi-source-output' : ''}">
     <canvas class="output-canvas" id="output-canvas"></canvas>
     <div class="output-labels" id="labels"></div>
     <div id="blackout"></div>
@@ -26,7 +29,7 @@ function ensureRenderer() {
 function activeProjectors(session) {
   const cameras = normalizeSceneCameras(session.sceneBuilder?.cameras || session.projectors);
   const mappings = session.outputMappings || { left: 'L', front: 'F', right: 'R', ceiling: 'C' };
-  const slots = session.layoutMode === 'ceiling' ? ['left', 'front', 'right', 'ceiling'] : ['left', 'front', 'right'];
+  const slots = requestedSlot ? [requestedSlot] : session.layoutMode === 'ceiling' ? ['left', 'front', 'right', 'ceiling'] : ['left', 'front', 'right'];
   return slots.map((slot) => {
     const camera = cameras.find((item) => item.id === mappings[slot]);
     if (!camera) return null;
