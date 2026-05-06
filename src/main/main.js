@@ -293,6 +293,15 @@ async function runSmokeCheck() {
         document.querySelector('[data-action="add-camera"]')?.click();
         await wait(500);
         result.cameraCountAfterAdd = document.querySelectorAll('.projector-row[data-action="select-camera"]').length;
+        const yawSlider = document.querySelector('[data-slider-kind="camera"][data-key="yaw"]');
+        if (yawSlider) {
+          yawSlider.value = '0.5';
+          yawSlider.dispatchEvent(new Event('input', { bubbles: true }));
+          await wait(500);
+          const nextYawSlider = document.querySelector('[data-slider-kind="camera"][data-key="yaw"]');
+          result.yawSliderUpdated = !!nextYawSlider && Math.abs(Number(nextYawSlider.value) - 0.5) < 0.01;
+          result.yawSliderDomStable = yawSlider === nextYawSlider;
+        }
         document.querySelector('[data-surface="live"]')?.click();
         await wait(600);
         result.returnedLive = document.body.textContent.includes('Generation Pipeline');
@@ -312,7 +321,7 @@ async function runSmokeCheck() {
       })();
     `);
     debugLog(`smoke ${JSON.stringify(report)}`);
-    const failed = !report.loaded || !report.liveVisible || !report.sceneVisible || !report.returnedLive || !report.generateProgression || !report.loadedPreviousWorld || !report.fallbackState || !report.surfaceScrollAfter?.canReachBottom || !report.sceneControls?.yawSlider || !report.sceneControls?.addCamera || report.cameraCountAfterAdd < 5;
+    const failed = !report.loaded || !report.liveVisible || !report.sceneVisible || !report.returnedLive || !report.generateProgression || !report.loadedPreviousWorld || !report.fallbackState || !report.surfaceScrollAfter?.canReachBottom || !report.sceneControls?.yawSlider || !report.sceneControls?.addCamera || report.cameraCountAfterAdd < 5 || !report.yawSliderUpdated || !report.yawSliderDomStable;
     setTimeout(() => {
       app.exit(failed ? 1 : 0);
     }, 250);

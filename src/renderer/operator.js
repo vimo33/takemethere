@@ -148,7 +148,7 @@ function getRenderSignature() {
     session?.sceneBuilder?.selectedCameraId || '',
     session?.sceneBuilder?.depthMode || 'single',
     JSON.stringify(session?.outputMappings || {}),
-    sceneCameras.map((camera) => `${camera.id}:${camera.live ? 1 : 0}:${camera.outputSlot}:${camera.orientation}:${camera.yaw}:${camera.pitch}:${camera.fov}:${camera.offX}:${camera.offY}:${camera.offZ}`).join('|'),
+    sceneCameras.map((camera) => `${camera.id}:${camera.label}:${camera.signal}:${camera.live ? 1 : 0}:${camera.outputSlot}:${camera.orientation}:${camera.color}`).join('|'),
     projectors.map((projector) => `${projector.id}:${projector.live ? 1 : 0}:${projector.signal}`).join('|')
   ].join('::');
 }
