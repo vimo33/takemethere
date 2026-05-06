@@ -2,16 +2,17 @@
 
 Internal prototype for a 3-wall AI portal installation.
 
-The app opens an Operator window plus three clean projector frame windows (`TakeMeThere_LEFT`, `TakeMeThere_FRONT`, `TakeMeThere_RIGHT`) that MadMapper picks up via Spout.
+The app opens a Mission Control cockpit. A single layered equirectangular world sphere is viewed by arbitrary virtual projector cameras, and the app publishes final camera feeds as NDI streams such as `TakeMeThere_LEFT`, `TakeMeThere_FRONT`, and `TakeMeThere_RIGHT`. Output monitoring happens inside the cockpit; fixed off-screen NDI source surfaces are used only as a bridge for the current native helper.
 
 Prototype 1 uses a generated still image plus subtle procedural Three.js motion. Without an API key it runs on local recipe generation and fallback visuals.
 
 ## Requirements
 
-- Windows 10/11 (Spout pipeline is Windows-only — see `docs/SPOUT_MADMAPPER_SETUP.md`)
+- Windows 10/11 for the current native NDI helper
 - Node.js 18+ and npm
-- MadMapper (on the same Windows machine for Spout)
+- MadMapper 6.x with NDI input enabled
 - Optional: Gemini API key for cloud image generation
+- Native NDI helper for projector feeds (see `docs/NDI_NATIVE_HELPER.md`)
 
 ## Quick Start
 
@@ -33,12 +34,14 @@ npm.cmd run dev:windows
 
 | Command | What it does |
 | --- | --- |
-| `npm run dev` | Start the Electron app (Operator + three frame windows). |
+| `npm run dev` | Start the Electron Mission Control app. |
 | `npm run dev:windows` | Same as `dev`, but pins Electron's cache to `./.local-appdata`. Use on locked-down Windows machines. |
 | `npm start` | Alias for `npm run dev`. |
 | `npm run check` | Run `scripts/check-config.cjs` to validate environment/config. |
-| `npm run spout:settings` | Open SpoutSettings.exe (bundled in `tools/Spout2`). |
-| `npm run spout:capture` | Launch three SpoutWinCapture senders that mirror the frame windows into MadMapper. |
+| `npm run spout:settings` | Legacy only: open SpoutSettings.exe. |
+| `npm run spout:capture` | Legacy only: launch SpoutWinCapture senders. |
+| `npm run ndi:configure` | Configure the native Windows NDI helper build. Requires `NDI_SDK_DIR`. |
+| `npm run ndi:build` | Build the native Windows NDI helper after configuration. |
 
 ## API Keys (optional)
 
@@ -65,19 +68,35 @@ export IMAGE_PROVIDER="openai"
 export OPENAI_API_KEY="your-key"
 ```
 
-## Spout → MadMapper
+## NDI to MadMapper
 
-Full setup in `docs/SPOUT_MADMAPPER_SETUP.md`. Short version:
+Build or install the native helper, then start the app:
 
-1. `npm run dev` — wait until the three frame windows (`TakeMeThere_LEFT/FRONT/RIGHT`) are visible.
-2. `npm run spout:capture` — three `SpoutWinCapture` windows open and republish the frame windows as Spout senders.
-3. In MadMapper, add three Spout inputs with those names and assign them to the projector surfaces.
+```powershell
+$env:NDI_SDK_DIR="C:\Program Files\NDI\NDI 6 SDK"
+npm.cmd run ndi:configure
+npm.cmd run ndi:build
+npm.cmd run dev:windows
+```
 
-Notes:
+In MadMapper, add NDI media inputs using the feed names from the Scene tab and assign them to surfaces such as `Quad-1`, `Quad-2`, and `Quad-3`.
 
-- Order matters: the Electron frame windows must exist *before* starting the capture senders.
-- Spout shares DirectX textures locally — MadMapper must run on the same Windows machine. For a Mac MadMapper, you'd need an NDI bridge instead.
-- If a sender doesn't appear in MadMapper, close and reopen that one capture window after its frame window is visible.
+Spout documentation remains in `docs/SPOUT_MADMAPPER_SETUP.md` for legacy tests, but NDI is the default path now.
+
+## Setup Mode
+
+Setup Mode is the install screen for alignment and transport checks:
+
+- Output health cards for arbitrary virtual projector cameras.
+- Transport is NDI by default.
+- Test cards: black, white, RGB, grid, checkerboard, edge frame, crosshair, horizon/seams, and labels.
+- Identify buttons to flash left/front/right in the app and through MadMapper surface opacity where available.
+- MadMapper OSCQuery discovery at `http://127.0.0.1:8010/?` by default.
+- Room presets saved locally under `room-presets/`.
+- Room Preview with a layered world sphere, camera positions, FOV cones, seam zones, scan mesh import, and draggable camera markers.
+- Optional SAM 2 mask generation hook for foreground layer previews.
+
+MadMapper preset naming and cue recommendations are in `docs/MADMAPPER_6_PRESET_TEMPLATE.md`.
 
 ## MadMapper Output Modes
 

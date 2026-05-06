@@ -7,11 +7,14 @@ session-history.json
 electron-debug.log
 generated-media/
 generated-worlds/
+room-presets/
 .superpowers/
 .env
 .npm-cache/
 .electron-cache/
 .local-appdata/
 tools/
+native/ndi-helper/bin/
+native/ndi-helper/build/
 gemini-response.json
 gemini-test.json

@@ -10,7 +10,10 @@
     "start": "electron .",
     "check": "node scripts/check-config.cjs",
     "spout:settings": "scripts\\open-spout-settings.bat",
-    "spout:capture": "scripts\\start-spout-captures.bat"
+    "spout:capture": "scripts\\start-spout-captures.bat",
+    "ndi:preflight": "node scripts/check-ndi-build.cjs",
+    "ndi:configure": "node scripts/ndi-cmake.cjs configure",
+    "ndi:build": "node scripts/ndi-cmake.cjs build"
   },
   "dependencies": {
     "three": "^0.181.2"

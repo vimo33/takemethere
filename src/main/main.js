@@ -1,14 +1,24 @@
 const path = require('node:path');
 const fs = require('node:fs');
 const { spawn } = require('node:child_process');
-const { pathToFileURL } = require('node:url');
+const { pathToFileURL, fileURLToPath } = require('node:url');
 
 loadProjectEnv(path.join(__dirname, '../../.env'));
 
-const { app, BrowserWindow, ipcMain, screen } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, dialog } = require('electron');
 const { getState } = require('./state-machine.cjs');
 const { createFallbackRecipe } = require('./world-recipe.cjs');
 const { expandPrompt, generateImage, createSvgDataUrl } = require('./ai-service.cjs');
+const madMapper = require('./madmapper-control.cjs');
+const ndiManager = require('./ndi-manager.cjs');
+const roomPresets = require('./room-presets.cjs');
+const {
+  HELPER_FEEDS,
+  DEFAULT_SETUP_STATE,
+  createOutputBusState,
+  createProjectorFeeds,
+  updateFeedHealth
+} = require('./output-bus.cjs');
 
 function loadProjectEnv(envPath) {
   if (!fs.existsSync(envPath)) return;
@@ -29,6 +39,7 @@ let outputWindows = [];
 
 const DEBUG_LOG = path.join(__dirname, '../../electron-debug.log');
 const DEPTH_TIMEOUT_MS = Number(process.env.DEPTH_TIMEOUT_MS || 45000);
+const MASK_TIMEOUT_MS = Number(process.env.MASK_TIMEOUT_MS || 90000);
 const DEPTH_GPU = process.env.DEPTH_GPU || '1';
 const DEFAULT_PROJECTOR_CONFIG = {
   leftYaw: 69,
@@ -47,6 +58,8 @@ function debugLog(message, error) {
 process.on('uncaughtException', (error) => debugLog('uncaughtException', error));
 process.on('unhandledRejection', (error) => debugLog('unhandledRejection', error));
 
+const defaultRoom = roomPresets.createDefaultRoom('three-wall');
+
 const session = {
   state: getState('IDLE'),
   recipe: createFallbackRecipe('somewhere calm, blue, and endless'),
@@ -56,8 +69,15 @@ const session = {
   depthFileUrl: '',
   depthStatus: 'idle',
   depthError: '',
+  maskDataUrl: null,
+  maskFileUrl: '',
+  maskStatus: 'idle',
+  maskError: '',
   visualMode: 'auto',
   projectorConfig: { ...DEFAULT_PROJECTOR_CONFIG },
+  setup: { ...DEFAULT_SETUP_STATE },
+  outputBus: createOutputBusState(defaultRoom, DEFAULT_SETUP_STATE),
+  room: defaultRoom,
   transcript: '',
   layoutMode: 'three-wall',
   blackout: false,
@@ -72,10 +92,6 @@ const session = {
 };
 
 function createWindows() {
-  const displays = screen.getAllDisplays();
-  const external = displays.find((display) => display.bounds.x !== 0 || display.bounds.y !== 0) || displays[0];
-  const outputViews = ['left', 'front', 'right'];
-
   operatorWindow = new BrowserWindow({
     width: 1280,
     height: 860,
@@ -87,21 +103,34 @@ function createWindows() {
     }
   });
 
-  outputWindows = outputViews.map((viewName, index) => createOutputWindow(external, viewName, index, outputViews.length));
+  syncProjectorWindows();
+  if (session.setup.transport === 'ndi') ndiManager.start(activeTransportFeeds());
 
   operatorWindow.loadFile(path.join(__dirname, '../../index.html'));
+  operatorWindow.webContents.on('did-finish-load', () => debugLog('operator did-finish-load'));
+  operatorWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
+    debugLog(`operator did-fail-load ${errorCode} ${errorDescription} ${validatedURL}`);
+  });
+  operatorWindow.webContents.on('render-process-gone', (_event, details) => {
+    debugLog(`operator render-process-gone ${JSON.stringify(details)}`);
+  });
+  operatorWindow.webContents.on('console-message', (_event, level, message, line, sourceId) => {
+    debugLog(`operator console level=${level} ${sourceId}:${line} ${message}`);
+  });
 
   operatorWindow.on('closed', () => {
     operatorWindow = null;
   });
 }
 
-function createOutputWindow(display, viewName, index, totalViews) {
-  const width = Math.max(640, Math.floor(Math.min(1920, display.workAreaSize?.width || display.bounds.width || 1920) / Math.min(totalViews, 3)));
-  const height = Math.max(360, Math.floor(width * 9 / 16));
-  const x = display.bounds.x + (index * Math.min(width + 16, Math.floor((display.bounds.width || width) / Math.max(totalViews, 1))));
-  const y = display.bounds.y + 40 + (index % 2) * 28;
-  const title = `TakeMeThere_${viewName.toUpperCase()}`;
+function createOutputWindow(display, feed, index, totalViews) {
+  const productionWidth = feed.resolution?.width || feed.targetWidth || 1920;
+  const productionHeight = feed.resolution?.height || feed.targetHeight || 1080;
+  const width = Math.max(320, Math.round(productionWidth));
+  const height = Math.max(240, Math.round(productionHeight));
+  const x = -32000 + index * 8;
+  const y = -32000 + index * 8;
+  const title = feed.name;
   const win = new BrowserWindow({
     x,
     y,
@@ -109,9 +138,15 @@ function createOutputWindow(display, viewName, index, totalViews) {
     height,
     title,
     backgroundColor: '#000000',
+    resizable: false,
+    maximizable: false,
     fullscreenable: true,
     autoHideMenuBar: true,
     useContentSize: true,
+    show: false,
+    skipTaskbar: true,
+    focusable: false,
+    paintWhenInitiallyHidden: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -119,29 +154,58 @@ function createOutputWindow(display, viewName, index, totalViews) {
     }
   });
 
-  win.loadFile(path.join(__dirname, '../../output.html'), { query: { view: viewName } });
+  win.loadFile(path.join(__dirname, '../../output.html'), { query: buildOutputQuery(feed) });
   win.on('ready-to-show', () => {
-    win.show();
-    debugLog(`output ${viewName} ready-to-show`);
+    if (session.setup.transport === 'ndi') win.showInactive();
+    setFeedHealth(feed.id, { windowAlive: true, transportStatus: session.setup.transport });
+    debugLog(`ndi source ${feed.id} ready-to-show`);
+    if (session.setup.transport === 'ndi' && !win.__ndiSubscribed) {
+      try {
+        win.webContents.beginFrameSubscription(false, (image) => {
+          if (image.isEmpty()) return;
+          const size = image.getSize();
+          const bitmap = image.getBitmap();
+          if (!bitmap || !size.width || !size.height) return;
+          ndiManager.sendFrame(feed.name, bitmap, size.width, size.height);
+        });
+        win.__ndiSubscribed = true;
+        win.on('closed', () => {
+          try { win.webContents.endFrameSubscription(); } catch (_err) { /* window already gone */ }
+        });
+      } catch (error) {
+        debugLog(`ndi frame subscription failed for ${feed.id}: ${error.message}`);
+      }
+    }
   });
-  win.webContents.on('did-finish-load', () => debugLog(`output ${viewName} did-finish-load`));
+  win.webContents.on('did-finish-load', () => debugLog(`output ${feed.id} did-finish-load`));
   win.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
-    debugLog(`output ${viewName} did-fail-load ${errorCode} ${errorDescription} ${validatedURL}`);
+    debugLog(`output ${feed.id} did-fail-load ${errorCode} ${errorDescription} ${validatedURL}`);
   });
   win.webContents.on('render-process-gone', (_event, details) => {
-    debugLog(`output ${viewName} render-process-gone ${JSON.stringify(details)}`);
+    setFeedHealth(feed.id, { windowAlive: false });
+    debugLog(`output ${feed.id} render-process-gone ${JSON.stringify(details)}`);
   });
   win.webContents.on('console-message', (_event, level, message, line, sourceId) => {
-    debugLog(`output ${viewName} console level=${level} ${sourceId}:${line} ${message}`);
+    debugLog(`output ${feed.id} console level=${level} ${sourceId}:${line} ${message}`);
   });
-  win.on('hide', () => debugLog(`output ${viewName} hidden`));
-  win.on('show', () => debugLog(`output ${viewName} shown`));
-  win.on('minimize', () => debugLog(`output ${viewName} minimized`));
-  win.on('unresponsive', () => debugLog(`output ${viewName} unresponsive`));
+  win.on('hide', () => debugLog(`output ${feed.id} hidden`));
+  win.on('show', () => debugLog(`output ${feed.id} shown`));
+  win.on('minimize', () => debugLog(`output ${feed.id} minimized`));
+  win.on('unresponsive', () => debugLog(`output ${feed.id} unresponsive`));
   win.on('closed', () => {
     outputWindows = outputWindows.filter((output) => output !== win);
+    setFeedHealth(feed.id, { windowAlive: false });
   });
   return win;
+}
+
+function buildOutputQuery(feed) {
+  if (feed.role === 'helper') return { feed: feed.feed, feedId: feed.id };
+  return { view: feed.view || feed.id, feedId: feed.id };
+}
+
+function getProjectorFeeds() {
+  return createProjectorFeeds(session.room);
 }
 
 function getOutputWindows() {
@@ -157,7 +221,8 @@ function broadcastSession() {
 function serializeSession() {
   return {
     ...session,
-    state: session.state
+    state: session.state,
+    ndi: ndiManager.getStatus()
   };
 }
 
@@ -165,6 +230,136 @@ function setState(key, extras = {}) {
   session.state = getState(key);
   Object.assign(session, extras);
   broadcastSession();
+}
+
+function setFeedHealth(id, patch) {
+  session.outputBus = updateFeedHealth(session.outputBus, id, patch);
+  broadcastSession();
+}
+
+function syncHelperWindows() {
+  for (const feed of HELPER_FEEDS) setFeedHealth(feed.id, { windowAlive: false, expectedSpout: false, expectedNdi: false, transportStatus: 'monitor' });
+}
+
+function syncOutputBusExpectations() {
+  session.outputBus = createOutputBusState(session.room, session.setup, session.outputBus);
+}
+
+function syncProjectorWindows() {
+  if (!app.isReady()) return;
+  const displays = screen.getAllDisplays();
+  const display = displays.find((item) => item.bounds.x !== 0 || item.bounds.y !== 0) || displays[0];
+  const feeds = getProjectorFeeds();
+  const existing = new Map(outputWindows.filter((win) => !win.isDestroyed()).map((win) => [win.getTitle(), win]));
+  const nextWindows = [];
+  for (const [index, feed] of feeds.entries()) {
+    let win = existing.get(feed.name);
+    if (win) {
+      const [width, height] = win.getContentSize();
+      if (width !== feed.resolution.width || height !== feed.resolution.height) {
+        win.setContentSize(feed.resolution.width, feed.resolution.height);
+      }
+      setFeedHealth(feed.id, { windowAlive: true, transportStatus: session.setup.transport });
+    } else {
+      win = createOutputWindow(display, feed, index, feeds.length);
+    }
+    nextWindows.push(win);
+  }
+  const activeTitles = new Set(feeds.map((feed) => feed.name));
+  for (const win of outputWindows) {
+    if (!win.isDestroyed() && !activeTitles.has(win.getTitle())) win.close();
+  }
+  outputWindows = nextWindows.filter((win) => !win.isDestroyed());
+}
+
+function normalizeSetupState(patch = {}) {
+  const current = session.setup || DEFAULT_SETUP_STATE;
+  const next = {
+    ...current,
+    ...patch,
+    madMapper: {
+      ...DEFAULT_SETUP_STATE.madMapper,
+      ...(current.madMapper || {}),
+      ...(patch.madMapper || {}),
+      cues: {
+        ...DEFAULT_SETUP_STATE.madMapper.cues,
+        ...(current.madMapper?.cues || {}),
+        ...(patch.madMapper?.cues || {})
+      }
+    }
+  };
+  next.transport = 'ndi';
+  if (!['world', 'black', 'white', 'red', 'green', 'blue', 'grid', 'checkerboard', 'edge-frame', 'crosshair', 'horizon', 'labels'].includes(next.testPattern)) next.testPattern = 'world';
+  if (!['all', 'left', 'front', 'right', 'depth', 'foreground', 'atmosphere'].includes(next.identifyTarget)) next.identifyTarget = 'all';
+  next.helperFeedsEnabled = Boolean(next.helperFeedsEnabled);
+  next.depthOpacity = clamp(Number(next.depthOpacity ?? 0.42), 0, 1);
+  next.foregroundThreshold = clamp(Number(next.foregroundThreshold ?? 0.68), 0, 1);
+  next.atmosphereIntensity = clamp(Number(next.atmosphereIntensity ?? 0.55), 0, 1);
+  next.atmosphereSoftness = clamp(Number(next.atmosphereSoftness ?? 0.45), 0, 1);
+  next.madMapper.host = String(next.madMapper.host || '127.0.0.1');
+  next.madMapper.oscPort = clamp(Math.round(Number(next.madMapper.oscPort || 8010)), 1, 65535);
+  next.madMapper.queryPort = clamp(Math.round(Number(next.madMapper.queryPort || 8010)), 1, 65535);
+  return next;
+}
+
+function applySetupState(patch = {}) {
+  const previousTransport = session.setup.transport;
+  const previousHelperFeedsEnabled = Boolean(session.setup.helperFeedsEnabled);
+  session.setup = normalizeSetupState(patch);
+  syncHelperWindows();
+  syncOutputBusExpectations();
+  const transportChanged = previousTransport !== session.setup.transport;
+  const helperChanged = previousHelperFeedsEnabled !== Boolean(session.setup.helperFeedsEnabled);
+  if (transportChanged || helperChanged || !ndiManager.getStatus().running) ndiManager.start(activeTransportFeeds());
+  broadcastSession();
+  return serializeSession();
+}
+
+function activeTransportFeeds() {
+  return session.outputBus.filter((feed) => feed.role === 'projector');
+}
+
+function applyRoomPreset(preset) {
+  session.layoutMode = preset.layoutMode === 'ceiling' ? 'ceiling' : 'three-wall';
+  session.room = roomPresets.normalizeRoom(preset.room || roomPresets.createDefaultRoom(session.layoutMode));
+  session.projectorConfig = normalizeProjectorConfig(preset.projectorConfig || {});
+  syncOutputBusExpectations();
+  syncProjectorWindows();
+  restartNdiIfRunning();
+  applySetupState(preset.setup || {});
+  return serializeSession();
+}
+
+function applyRoomPatch(patch = {}) {
+  session.room = roomPresets.normalizeRoom({
+    ...session.room,
+    ...patch,
+    dimensions: { ...(session.room?.dimensions || {}), ...(patch.dimensions || {}) },
+    visitor: { ...(session.room?.visitor || {}), ...(patch.visitor || {}) },
+    scan: { ...(session.room?.scan || {}), ...(patch.scan || {}) }
+  });
+  session.projectorConfig = normalizeProjectorConfig(roomPresets.projectorConfigFromRoom(session.room));
+  syncOutputBusExpectations();
+  syncProjectorWindows();
+  restartNdiIfRunning();
+  broadcastSession();
+  return serializeSession();
+}
+
+function restartNdiIfRunning() {
+  if (session.setup.transport !== 'ndi') return;
+  if (ndiManager.getStatus().enabled || ndiManager.getStatus().running) ndiManager.start(activeTransportFeeds());
+}
+
+function syncRoomFromProjectorConfig() {
+  const projectors = (session.room?.projectors || []).map((projector) => {
+    if (projector.id === 'left') return { ...projector, yaw: session.projectorConfig.leftYaw, fov: session.projectorConfig.fov };
+    if (projector.id === 'front') return { ...projector, yaw: session.projectorConfig.frontYaw, fov: session.projectorConfig.fov };
+    if (projector.id === 'right') return { ...projector, yaw: session.projectorConfig.rightYaw, fov: session.projectorConfig.fov };
+    if (projector.id === 'ceiling') return { ...projector, pitch: session.projectorConfig.ceilingPitch, fov: session.projectorConfig.ceilingFov };
+    return projector;
+  });
+  session.room = roomPresets.normalizeRoom({ ...session.room, projectors });
 }
 
 function imageDataUrlToBuffer(imageDataUrl) {
@@ -323,6 +518,92 @@ function generateDepth(assetInfo) {
   });
 }
 
+function generateSamMasks() {
+  const imagePath = getCurrentImagePath();
+  if (!imagePath) {
+    session.maskStatus = 'failed';
+    session.maskError = 'No generated image file is available for mask generation.';
+    broadcastSession();
+    return;
+  }
+
+  const command = process.env.SAM2_HELPER_COMMAND;
+  if (!command) {
+    session.maskStatus = 'skipped';
+    session.maskError = 'SAM2_HELPER_COMMAND is not configured. Depth-band foreground remains active.';
+    broadcastSession();
+    return;
+  }
+
+  const outputPath = path.join(path.dirname(imagePath), 'sam2-mask.png');
+  session.maskStatus = 'generating';
+  session.maskError = '';
+  session.maskDataUrl = null;
+  session.maskFileUrl = '';
+  broadcastSession();
+
+  const child = spawn(command, [imagePath, outputPath], {
+    cwd: path.join(__dirname, '../..'),
+    windowsHide: true,
+    shell: true,
+    env: { ...process.env, CUDA_VISIBLE_DEVICES: DEPTH_GPU, DEPTH_GPU }
+  });
+
+  let stderr = '';
+  let didTimeout = false;
+  const timeout = setTimeout(() => {
+    didTimeout = true;
+    child.kill();
+  }, MASK_TIMEOUT_MS);
+
+  child.stderr.on('data', (chunk) => {
+    stderr += chunk.toString();
+  });
+
+  child.on('error', (error) => {
+    clearTimeout(timeout);
+    session.maskStatus = 'failed';
+    session.maskError = error.message;
+    debugLog('SAM 2 helper failed to start', error);
+    broadcastSession();
+  });
+
+  child.on('close', (code) => {
+    clearTimeout(timeout);
+    if (didTimeout) {
+      session.maskStatus = 'failed';
+      session.maskError = `SAM 2 mask generation timed out after ${MASK_TIMEOUT_MS}ms.`;
+      broadcastSession();
+      return;
+    }
+    if (code !== 0 || !fs.existsSync(outputPath)) {
+      session.maskStatus = 'failed';
+      session.maskError = stderr.trim() || `SAM 2 helper exited with code ${code}.`;
+      broadcastSession();
+      return;
+    }
+    try {
+      session.maskDataUrl = fileToDataUrl(outputPath);
+      session.maskFileUrl = pathToFileURL(outputPath).href;
+      session.maskStatus = 'ready';
+      session.maskError = '';
+    } catch (error) {
+      session.maskStatus = 'failed';
+      session.maskError = error.message;
+    }
+    broadcastSession();
+  });
+}
+
+function getCurrentImagePath() {
+  if (!session.imageFileUrl?.startsWith('file:')) return '';
+  try {
+    return fileURLToPath(session.imageFileUrl);
+  } catch {
+    return '';
+  }
+}
+
 function writeSessionHistory(eventName) {
   const record = {
     at: new Date().toISOString(),
@@ -338,6 +619,8 @@ function writeSessionHistory(eventName) {
     projectorConfig: session.projectorConfig,
     depthStatus: session.depthStatus,
     depthError: session.depthError,
+    maskStatus: session.maskStatus,
+    maskError: session.maskError,
     error: session.error
   };
 
@@ -360,6 +643,10 @@ async function generateWorld(visitorInput) {
   session.depthDataUrl = null;
   session.depthFileUrl = '';
   session.imageFileUrl = '';
+  session.maskDataUrl = null;
+  session.maskFileUrl = '';
+  session.maskStatus = 'idle';
+  session.maskError = '';
   session.depthStatus = 'idle';
   session.depthError = '';
   session.timings = {};
@@ -409,6 +696,10 @@ async function generateWorld(visitorInput) {
     session.error = error.message;
     session.imageDataUrl = createSvgDataUrl(session.recipe);
     session.imageFileUrl = '';
+    session.maskDataUrl = null;
+    session.maskFileUrl = '';
+    session.maskStatus = 'skipped';
+    session.maskError = 'SAM 2 masks skipped because image generation used the SVG fallback.';
     session.provider.image = 'local-svg-fallback-after-error';
     session.depthStatus = 'skipped';
     session.depthError = 'Depth generation skipped because image generation used the SVG fallback.';
@@ -431,6 +722,10 @@ ipcMain.handle('session:set-state', (_event, key) => {
     session.depthDataUrl = null;
     session.depthFileUrl = '';
     session.imageFileUrl = '';
+    session.maskDataUrl = null;
+    session.maskFileUrl = '';
+    session.maskStatus = 'idle';
+    session.maskError = '';
     session.depthStatus = 'idle';
     session.depthError = '';
     session.timings = {};
@@ -458,6 +753,10 @@ ipcMain.handle('session:fallback-world', (_event, visitorInput) => {
   session.provider.depth = 'skipped';
   session.depthDataUrl = null;
   session.depthFileUrl = '';
+  session.maskDataUrl = null;
+  session.maskFileUrl = '';
+  session.maskStatus = 'skipped';
+  session.maskError = 'SAM 2 masks skipped for local SVG fallback.';
   session.depthStatus = 'skipped';
   session.depthError = 'Depth generation skipped for local SVG fallback.';
   session.costEstimateUsd = 0;
@@ -474,6 +773,11 @@ ipcMain.handle('session:set-layout', (_event, layoutMode) => {
   return serializeSession();
 });
 
+ipcMain.handle('masks:generate', () => {
+  generateSamMasks();
+  return serializeSession();
+});
+
 ipcMain.handle('session:set-visual-mode', (_event, visualMode) => {
   session.visualMode = ['auto', 'flat', 'depth'].includes(visualMode) ? visualMode : 'auto';
   broadcastSession();
@@ -482,9 +786,162 @@ ipcMain.handle('session:set-visual-mode', (_event, visualMode) => {
 
 ipcMain.handle('session:set-projector-config', (_event, config = {}) => {
   session.projectorConfig = normalizeProjectorConfig(config);
+  syncRoomFromProjectorConfig();
   broadcastSession();
   return serializeSession();
 });
+
+ipcMain.handle('room:set', (_event, patch = {}) => applyRoomPatch(patch));
+ipcMain.handle('room:layout-template', (_event, layoutType = 'three-wall') => roomPresets.createPresetForLayout(layoutType));
+ipcMain.handle('room:apply-layout-template', (_event, layoutType = 'three-wall') => {
+  const preset = roomPresets.createPresetForLayout(layoutType);
+  applyRoomPreset(preset);
+  return serializeSession();
+});
+ipcMain.handle('room:import-scan', async () => {
+  const result = await dialog.showOpenDialog(operatorWindow, {
+    title: 'Import room scan mesh',
+    properties: ['openFile'],
+    filters: [
+      { name: 'Room meshes', extensions: ['obj', 'gltf', 'glb'] },
+      { name: 'All files', extensions: ['*'] }
+    ]
+  });
+  if (result.canceled || !result.filePaths?.[0]) return serializeSession();
+  const meshPath = result.filePaths[0];
+  session.room = roomPresets.normalizeRoom({
+    ...session.room,
+    scan: {
+      meshPath,
+      meshFileUrl: pathToFileURL(meshPath).href,
+      visible: true
+    }
+  });
+  broadcastSession();
+  return serializeSession();
+});
+ipcMain.handle('room:clear-scan', () => {
+  session.room = roomPresets.normalizeRoom({
+    ...session.room,
+    scan: { meshPath: '', meshFileUrl: '', visible: false }
+  });
+  broadcastSession();
+  return serializeSession();
+});
+
+ipcMain.handle('setup:get', () => session.setup);
+ipcMain.handle('setup:update', (_event, patch = {}) => applySetupState(patch));
+
+ipcMain.handle('output:heartbeat', (_event, payload = {}) => {
+  const feedId = String(payload.feedId || '');
+  if (!feedId) return serializeSession();
+  setFeedHealth(feedId, {
+    windowAlive: true,
+    renderHeartbeatAt: Date.now(),
+    lastFrameAt: Date.now(),
+    width: Math.round(Number(payload.width || 0)),
+    height: Math.round(Number(payload.height || 0)),
+    fps: Math.round(Number(payload.fps || 0))
+  });
+  return serializeSession();
+});
+
+ipcMain.handle('ndi:start', () => {
+  ndiManager.start(activeTransportFeeds());
+  broadcastSession();
+  return ndiManager.getStatus();
+});
+
+ipcMain.handle('ndi:stop', () => {
+  ndiManager.stop();
+  broadcastSession();
+  return ndiManager.getStatus();
+});
+
+ipcMain.handle('ndi:status', () => ndiManager.getStatus());
+
+ipcMain.handle('room-presets:list', () => roomPresets.listPresets());
+ipcMain.handle('room-presets:default', () => roomPresets.createDefaultPreset());
+ipcMain.handle('room-presets:load', (_event, id) => {
+  const preset = roomPresets.loadPreset(id);
+  applyRoomPreset(preset);
+  return preset;
+});
+ipcMain.handle('room-presets:save', (_event, preset = {}) => {
+  const saved = roomPresets.savePreset({
+    ...preset,
+    layoutMode: session.layoutMode,
+    projectorConfig: session.projectorConfig,
+    setup: session.setup,
+    room: session.room,
+    outputs: session.outputBus.map((feed) => ({
+      id: feed.id,
+      name: feed.name,
+      role: feed.role,
+      feedName: feed.name,
+      surface: feed.madMapperSurface || feed.surface || '',
+      transport: session.setup.transport,
+      orientation: feed.orientation || 'landscape',
+      resolution: feed.resolution || { width: feed.targetWidth || 1920, height: feed.targetHeight || 1080 }
+    }))
+  });
+  return saved;
+});
+
+ipcMain.handle('madmapper:discover', (_event, config = {}) => madMapper.discover(config));
+ipcMain.handle('madmapper:get-value', (_event, path, config = {}) => madMapper.getValue(path, config));
+ipcMain.handle('madmapper:send', (_event, path, value, config = {}) => madMapper.send(path, value, config));
+ipcMain.handle('madmapper:trigger', (_event, path, config = {}) => madMapper.trigger(path, config));
+ipcMain.handle('madmapper:trigger-cue', (_event, cueKey, config = {}) => {
+  const cuePath = session.setup.madMapper?.cues?.[cueKey];
+  if (!cuePath) throw new Error(`No MadMapper cue path configured for ${cueKey}.`);
+  return madMapper.trigger(cuePath, { ...session.setup.madMapper, ...config });
+});
+
+ipcMain.handle('outputs:show-production', () => {
+  const display = screen.getPrimaryDisplay();
+  for (const [index, win] of getOutputWindows().entries()) {
+    win.setPosition(display.bounds.x + 40 + index * 28, display.bounds.y + 40 + index * 28);
+    win.showInactive();
+  }
+  return serializeSession();
+});
+
+ipcMain.handle('outputs:hide-production', () => {
+  for (const [index, win] of getOutputWindows().entries()) {
+    win.setPosition(-32000 + index * 8, -32000 + index * 8);
+    win.showInactive();
+  }
+  return serializeSession();
+});
+
+ipcMain.handle('outputs:validate-madmapper', async (_event, config = {}) => {
+  const discovery = await madMapper.discover({ ...session.setup.madMapper, ...config });
+  return validateMadMapperAssignment(discovery);
+});
+
+function validateMadMapperAssignment(discovery = {}) {
+  const mediaNames = new Set((discovery.media || []).map((item) => String(item.name || '').toLowerCase()));
+  const surfaceNames = new Set((discovery.surfaces || []).map((item) => String(item.name || '').toLowerCase()));
+  const checks = activeTransportFeeds().map((feed) => {
+    const mediaFound = mediaNames.has(String(feed.name || '').toLowerCase());
+    const surfaceFound = !feed.surface || surfaceNames.has(String(feed.surface).toLowerCase());
+    return {
+      id: feed.id,
+      name: feed.name,
+      role: feed.role,
+      surface: feed.surface || '',
+      mediaFound,
+      surfaceFound,
+      status: mediaFound && surfaceFound ? 'READY' : mediaFound || surfaceFound ? 'DEGRADED' : 'MISSING'
+    };
+  });
+  return {
+    ok: checks.every((check) => check.status === 'READY'),
+    checkedAt: new Date().toISOString(),
+    checks
+  };
+}
 
 function normalizeProjectorConfig(config) {
   const next = { ...DEFAULT_PROJECTOR_CONFIG, ...session.projectorConfig };
@@ -505,15 +962,11 @@ function clamp(value, min, max) {
 }
 
 ipcMain.handle('window:output-fullscreen', () => {
-  const outputs = getOutputWindows();
-  const shouldFullscreen = outputs.some((win) => !win.isFullScreen());
-  for (const win of outputs) win.setFullScreen(shouldFullscreen);
-  return shouldFullscreen;
+  return false;
 });
 
 ipcMain.handle('window:focus-output', () => {
-  for (const win of getOutputWindows()) win.show();
-  getOutputWindows()[0]?.focus();
+  operatorWindow?.focus();
   return true;
 });
 
