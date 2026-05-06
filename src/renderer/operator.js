@@ -1,86 +1,597 @@
 import { AudioEngine } from './audio-engine.js';
+import { DEFAULT_PROJECTORS, SphereWorldRenderer, SphereWorldSceneBuilder, normalizeProjectors, normalizeSceneCameras, colorToCss } from './scene-engine.js';
 
 const api = window.takeMeThere;
 const audio = new AudioEngine();
-
 const root = document.querySelector('#operator-app');
+
+const PHASES = [
+  ['IDLE', 'Idle', ''],
+  ['LISTENING', 'Listening', 'cyan'],
+  ['UNDERSTANDING', 'Understanding', 'violet'],
+  ['GENERATING', 'Generating', 'amber'],
+  ['PORTAL_OPENING', 'Portal Opening', 'magenta'],
+  ['ARRIVAL', 'Arrival', 'magenta'],
+  ['WORLD_ACTIVE', 'World Active', 'green'],
+  ['EXIT', 'Exit', 'violet']
+];
+
+let session = null;
+let surface = 'live';
+let selectedProjectorId = 'F';
+let missionStart = null;
+let resetArmed = false;
+let promptValue = 'Take me to a forest where the trees are made of glass.';
+let renderers = [];
+let audioTimer = null;
+let audioTick = 0;
+let fileInput = null;
+let renderSignature = '';
+let generationInFlight = false;
+
 root.innerHTML = `
-  <main class="operator-shell">
-    <section class="panel control-panel">
-      <div class="brand-row"><div><h1>Take Me There</h1><h2>Operator dashboard</h2></div><div class="state-pill" id="state-pill">Idle</div></div>
-      <textarea class="prompt-box" id="prompt" placeholder="Where do you want to go?">Take me to a forest where the trees are made of glass.</textarea>
-      <div class="button-grid">
-        <button class="primary" id="start">Start session</button><button id="listen">Use microphone</button><button id="generate">Generate world</button><button id="regenerate">Regenerate image</button><button id="fallback">Skip to fallback</button><button id="arrival">Trigger arrival</button><button id="end">End session</button><button class="danger" id="blackout">Blackout</button>
-      </div>
-      <div class="button-row"><button class="ghost" id="reset">Reset</button><button class="ghost" id="focus-output">Focus output</button><button class="ghost" id="fullscreen-output">Output fullscreen</button><button class="ghost" id="reload-output">Reload output</button></div>
-      <label><h3>Output layout</h3><select id="layout"><option value="three-wall">3 walls: left / front / right</option><option value="ceiling">4 views: left / front / right / ceiling</option></select></label>
-    </section>
-    <section class="panel status-panel">
-      <div class="status-grid">
-        <div class="metric"><div class="label">Current state</div><div class="value" id="state-value">Idle</div></div><div class="metric"><div class="label">Generated title</div><div class="value" id="title-value">Unknown Dream</div></div><div class="metric"><div class="label">Prompt provider</div><div class="value" id="prompt-provider">local</div></div><div class="metric"><div class="label">Image provider</div><div class="value" id="image-provider">local</div></div><div class="metric"><div class="label">Latency</div><div class="value" id="latency-value">0 ms</div></div><div class="metric"><div class="label">Cost estimate</div><div class="value" id="cost-value">$0.00</div></div>
-      </div>
-      <div id="error-slot"></div>
-      <article class="recipe-card"><h3>Last transcript</h3><p id="transcript-value">No prompt yet.</p></article>
-      <article class="recipe-card"><h3>World recipe</h3><p id="visual-prompt">No world generated yet.</p><div class="palette" id="palette"></div></article>
-      <article class="recipe-card"><h3>Lighting / audio cue</h3><p id="cue-value">portal_breathing / idle_hum</p></article>
-    </section>
-  </main>
+  <div class="shell scanlines">
+    <header class="topbar" id="topbar"></header>
+    <div id="surface-root"></div>
+  </div>
 `;
 
-const els = {
-  statePill: document.querySelector('#state-pill'), prompt: document.querySelector('#prompt'), start: document.querySelector('#start'), listen: document.querySelector('#listen'), generate: document.querySelector('#generate'), regenerate: document.querySelector('#regenerate'), fallback: document.querySelector('#fallback'), arrival: document.querySelector('#arrival'), end: document.querySelector('#end'), blackout: document.querySelector('#blackout'), reset: document.querySelector('#reset'), layout: document.querySelector('#layout'), focusOutput: document.querySelector('#focus-output'), fullscreenOutput: document.querySelector('#fullscreen-output'), reloadOutput: document.querySelector('#reload-output'), stateValue: document.querySelector('#state-value'), titleValue: document.querySelector('#title-value'), promptProvider: document.querySelector('#prompt-provider'), imageProvider: document.querySelector('#image-provider'), latencyValue: document.querySelector('#latency-value'), costValue: document.querySelector('#cost-value'), transcriptValue: document.querySelector('#transcript-value'), visualPrompt: document.querySelector('#visual-prompt'), palette: document.querySelector('#palette'), cueValue: document.querySelector('#cue-value'), errorSlot: document.querySelector('#error-slot')
-};
+const topbar = document.querySelector('#topbar');
+const surfaceRoot = document.querySelector('#surface-root');
 
-els.start.addEventListener('click', () => api.setState('LISTENING'));
-els.generate.addEventListener('click', () => { audio.start('mechanical'); api.generateWorld(els.prompt.value); });
-els.regenerate.addEventListener('click', () => api.generateWorld(els.prompt.value));
-els.fallback.addEventListener('click', () => api.fallbackWorld(els.prompt.value));
-els.arrival.addEventListener('click', () => api.setState('ARRIVAL'));
-els.end.addEventListener('click', () => api.setState('EXIT'));
-els.blackout.addEventListener('click', () => { audio.mute(); api.setState('BLACKOUT'); });
-els.reset.addEventListener('click', () => { audio.mute(); api.setState('RESET'); });
-els.layout.addEventListener('change', () => api.setLayout(els.layout.value));
-els.focusOutput.addEventListener('click', () => api.focusOutput());
-els.fullscreenOutput.addEventListener('click', () => api.toggleOutputFullscreen());
-els.reloadOutput.addEventListener('click', () => api.reloadOutput());
-els.listen.addEventListener('click', startSpeechRecognition);
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
+}
 
-api.onSessionUpdate(renderSession);
-api.getSession().then(renderSession);
+function fmtMs(ms) {
+  if (ms == null) return '--';
+  if (ms < 1000) return `${ms} ms`;
+  return `${(ms / 1000).toFixed(2)} s`;
+}
 
-function renderSession(session) {
-  const state = session.state || {};
-  const recipe = session.recipe || {};
-  els.statePill.textContent = state.label || state.key || 'Idle';
-  els.stateValue.textContent = `${state.key || 'IDLE'} - ${state.projection || ''}`;
-  els.titleValue.textContent = recipe.title || 'Unknown Dream';
-  els.promptProvider.textContent = session.provider?.prompt || 'local';
-  els.imageProvider.textContent = session.provider?.image || 'local';
-  els.transcriptValue.textContent = session.transcript || 'No prompt yet.';
-  els.visualPrompt.textContent = recipe.visual_prompt || 'No world generated yet.';
-  els.cueValue.textContent = `${state.ledCue || '-'} / ${state.audioCue || '-'}`;
-  els.layout.value = session.layoutMode || 'three-wall';
-  const promptMs = session.timings?.promptMs || 0;
-  const imageMs = session.timings?.imageMs || 0;
-  els.latencyValue.textContent = `${promptMs + imageMs} ms`;
-  els.costValue.textContent = `$${Number(session.costEstimateUsd || 0).toFixed(2)}`;
-  els.palette.innerHTML = '';
-  for (const color of recipe.palette || []) {
-    const swatch = document.createElement('div');
-    swatch.className = 'swatch';
-    swatch.style.background = color;
-    swatch.title = color;
-    els.palette.appendChild(swatch);
+function fmtClock(ms) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  return `${String(Math.floor(total / 3600)).padStart(2, '0')}:${String(Math.floor((total % 3600) / 60)).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`;
+}
+
+function ledFor(key) {
+  return PHASES.find(([phase]) => phase === key)?.[2] || (key === 'BLACKOUT' || key === 'RESET' ? 'red' : key === 'ERROR_FALLBACK' ? 'amber' : 'cyan');
+}
+
+function disposeRenderers() {
+  for (const renderer of renderers) renderer.dispose();
+  renderers = [];
+}
+
+function setSurface(nextSurface) {
+  if (!nextSurface || nextSurface === surface) return;
+  surface = nextSurface;
+  api.updateSceneSettings({ surface: nextSurface });
+  render(true);
+}
+
+function updateMissionClock() {
+  const node = document.querySelector('[data-mission-clock]');
+  if (node) node.textContent = missionStart ? fmtClock(Date.now() - missionStart) : '--:--:--';
+}
+
+function startAudioBars() {
+  if (audioTimer) return;
+  audioTimer = setInterval(() => {
+    audioTick += 1;
+    for (const bar of document.querySelectorAll('.audio-bar i')) {
+      const index = Number(bar.dataset.index || 0);
+      const active = ['LISTENING', 'ARRIVAL', 'WORLD_ACTIVE'].includes(session?.state?.key);
+      const base = session?.state?.key === 'LISTENING' ? 0.82 : session?.state?.key === 'ARRIVAL' ? 0.95 : active ? 0.48 : 0.12;
+      const v = base * (0.35 + Math.abs(Math.sin(audioTick * 0.38 + index * 0.7)) * 0.65);
+      bar.style.height = `${4 + v * 16}px`;
+      bar.style.opacity = String(0.45 + v * 0.5);
+    }
+    updateMissionClock();
+  }, 120);
+}
+
+function renderTopbar() {
+  const state = session?.state || {};
+  const settings = session?.sceneSettings || {};
+  const projectors = normalizeProjectors(session?.projectors, session?.layoutMode);
+  const liveCount = projectors.filter((projector) => projector.live).length;
+  const wallTime = new Date().toLocaleTimeString('en-GB');
+  topbar.innerHTML = `
+    <div class="brand">
+      <div class="brand-mark"></div>
+      <div>
+        <div class="brand-name">TAKE ME THERE</div>
+        <div class="brand-sub">Operator Console · v0.4</div>
+      </div>
+    </div>
+    <div class="topbar-tape">
+      <div class="tape-cell signal-${ledFor(state.key)}">
+        <span class="label">Phase</span>
+        <span class="value"><span class="led ${ledFor(state.key)} ${(state.key === 'GENERATING' || state.key === 'LISTENING') ? 'pulse' : ''}" style="margin-right:6px"></span>${escapeHtml(state.label || 'Idle').toUpperCase()}</span>
+      </div>
+      <div class="tape-cell"><span class="label">Mission Clock</span><span class="value" data-mission-clock>${missionStart ? fmtClock(Date.now() - missionStart) : '--:--:--'}</span></div>
+      <div class="tape-cell"><span class="label">Local Time</span><span class="value">${wallTime}</span></div>
+      <div class="tape-cell signal-amber"><span class="label">Gen Spend</span><span class="value">$${Number(session?.costEstimateUsd || 0).toFixed(3)}</span></div>
+      <div class="tape-cell"><span class="label">Prompt Provider</span><span class="value">${escapeHtml(session?.provider?.prompt || 'local')}</span></div>
+      <div class="tape-cell"><span class="label">Image Provider</span><span class="value">${escapeHtml(session?.provider?.image || 'local')}</span></div>
+      <div class="tape-cell signal-green"><span class="label">Output</span><span class="value"><span class="led green" style="margin-right:6px"></span>${liveCount}/${projectors.length} LIVE</span></div>
+      <div class="tape-cell signal-violet"><span class="label">Mode</span><span class="value">${escapeHtml(settings.worldMode || 'single').toUpperCase()}</span></div>
+    </div>
+    <div class="topbar-right">
+      <div class="segmented">
+        <button class="${surface === 'live' ? 'active' : ''}" data-action="surface" data-surface="live">Live</button>
+        <button class="${surface === 'scene' ? 'active' : ''}" data-action="surface" data-surface="scene">Scene Builder</button>
+      </div>
+    </div>
+  `;
+}
+
+function getRenderSignature() {
+  const settings = session?.sceneSettings || {};
+  const stateKey = session?.state?.key || 'IDLE';
+  const projectors = normalizeProjectors(session?.projectors, session?.layoutMode);
+  const sceneCameras = normalizeSceneCameras(session?.sceneBuilder?.cameras);
+  return [
+    surface,
+    stateKey,
+    session?.layoutMode || 'three-wall',
+    session?.imageDataUrl ? `${session.imageDataUrl.length}:${session.timings?.imageMs || 0}` : 'no-image',
+    session?.history?.length || 0,
+    selectedProjectorId,
+    settings.worldMode || 'single',
+    settings.outputTestMode ? 'test' : 'world',
+    settings.testPattern || 'grid',
+    (session?.generatedWorlds || []).map((world) => world.name).join('|'),
+    session?.config?.hasGemini ? 'gemini' : 'no-gemini',
+    session?.config?.hasOpenAI ? 'openai' : 'no-openai',
+    session?.sceneBuilder?.selectedCameraId || '',
+    session?.sceneBuilder?.depthMode || 'single',
+    JSON.stringify(session?.outputMappings || {}),
+    sceneCameras.map((camera) => `${camera.id}:${camera.live ? 1 : 0}:${camera.outputSlot}:${camera.orientation}:${camera.yaw}:${camera.pitch}:${camera.fov}:${camera.offX}:${camera.offY}:${camera.offZ}`).join('|'),
+    projectors.map((projector) => `${projector.id}:${projector.live ? 1 : 0}:${projector.signal}`).join('|')
+  ].join('::');
+}
+
+function render(force = false) {
+  if (!session) return;
+  renderTopbar();
+  const nextSignature = getRenderSignature();
+  if (!force && nextSignature === renderSignature) {
+    updateSceneRenderers();
+    updateControlReadouts();
+    return;
   }
-  els.errorSlot.innerHTML = session.error ? `<div class="error">${session.error}</div>` : '';
-  if (['PORTAL_OPENING', 'ARRIVAL', 'WORLD_ACTIVE'].includes(state.key)) audio.start(recipe.sound_style || 'dream');
-  if (['EXIT', 'RESET', 'BLACKOUT', 'IDLE'].includes(state.key)) audio.mute();
+  renderSignature = nextSignature;
+  disposeRenderers();
+  surfaceRoot.innerHTML = surface === 'scene' ? sceneBuilderMarkup() : liveConsoleMarkup();
+  hydrateCanvases();
+  startAudioBars();
+}
+
+function updateSceneRenderers() {
+  for (const renderer of renderers) {
+    if (renderer instanceof SphereWorldSceneBuilder) {
+      renderer.updateConfig({
+        cameras: session.sceneBuilder?.cameras,
+        sceneBuilder: session.sceneBuilder,
+        selectedId: selectedProjectorId,
+        onCameraChange: (cameraId, patch) => api.updateSceneCamera(cameraId, patch),
+        onSelectCamera: (cameraId) => {
+          if (!cameraId) return;
+          selectedProjectorId = cameraId;
+          api.updateSceneBuilder({ selectedCameraId: cameraId });
+        },
+        onMainViewChange: (mainView) => api.updateSceneBuilder({ mainView })
+      });
+      continue;
+    }
+    const id = renderer.host?.dataset?.previewId;
+    const projectors = id
+      ? normalizeProjectors(session.projectors, session.layoutMode).filter((projector) => projector.id === id)
+      : session.projectors;
+    renderer.updateConfig({
+      projectors,
+      sceneSettings: { ...session.sceneSettings, overview: surface === 'scene' ? !!session.sceneSettings?.overview : false },
+      layoutMode: session.layoutMode,
+      selectedId: selectedProjectorId,
+      onProjectorChange: (projectorId, patch) => api.updateProjector(projectorId, patch)
+    });
+  }
+}
+
+function updateControlReadouts() {
+  const projectors = new Map(normalizeProjectors(session.projectors, session.layoutMode).map((projector) => [projector.id, projector]));
+  const cameras = new Map(normalizeSceneCameras(session.sceneBuilder?.cameras).map((camera) => [camera.id, camera]));
+  for (const input of surfaceRoot.querySelectorAll('[data-slider-kind="projector"]')) {
+    const projector = projectors.get(input.dataset.id);
+    if (!projector || document.activeElement === input) continue;
+    input.value = projector[input.dataset.key];
+    updateSliderDisplay(input);
+  }
+  for (const input of surfaceRoot.querySelectorAll('[data-slider-kind="camera"]')) {
+    const camera = cameras.get(input.dataset.id);
+    if (!camera || document.activeElement === input) continue;
+    input.value = camera[input.dataset.key];
+    updateSliderDisplay(input);
+  }
+  for (const input of surfaceRoot.querySelectorAll('[data-slider-kind="setting"]')) {
+    if (document.activeElement === input) continue;
+    input.value = session.sceneSettings?.[input.dataset.key] ?? input.value;
+    updateSliderDisplay(input);
+  }
+  for (const toggle of surfaceRoot.querySelectorAll('[data-action="projector-toggle"]')) {
+    const projector = projectors.get(toggle.dataset.id);
+    if (projector) toggle.classList.toggle('on', projector.live);
+  }
+  for (const toggle of surfaceRoot.querySelectorAll('[data-action="camera-toggle"]')) {
+    const camera = cameras.get(toggle.dataset.id);
+    if (camera) toggle.classList.toggle('on', camera.live);
+  }
+}
+
+function liveConsoleMarkup() {
+  const stateKey = session.state?.key || 'IDLE';
+  const recipe = session.recipe || {};
+  const settings = session.sceneSettings || {};
+  const config = session.config || {};
+  const pipeline = [
+    ['01', 'Transcribe', session.transcript ? 'done' : stateKey === 'LISTENING' ? 'active' : 'idle', 'browser-stt', session.transcript ? 1240 : null],
+    ['02', 'Expand Prompt', session.timings?.promptMs ? 'done' : stateKey === 'UNDERSTANDING' ? 'active' : 'idle', session.provider?.prompt || 'local', session.timings?.promptMs],
+    ['03', 'Generate Image', session.timings?.imageMs ? 'done' : stateKey === 'GENERATING' ? 'active' : 'idle', session.provider?.image || 'local', session.timings?.imageMs],
+    ['04', 'Load to Scene', session.imageDataUrl ? 'done' : 'idle', 'scene-builder', session.imageDataUrl ? 420 : null],
+    ['05', 'Open Portal', ['PORTAL_OPENING', 'ARRIVAL', 'WORLD_ACTIVE'].includes(stateKey) ? 'done' : 'idle', 'lighting-bus', ['ARRIVAL', 'WORLD_ACTIVE'].includes(stateKey) ? 4600 : null]
+  ];
+  const isGenerating = ['UNDERSTANDING', 'GENERATING'].includes(stateKey);
+  const isIdle = ['IDLE', 'LISTENING', 'RESET'].includes(stateKey);
+  const projectors = normalizeProjectors(session.projectors, session.layoutMode);
+
+  return `
+    <div class="main">
+      <aside class="left-rail">
+        <div class="panel-header"><h3>Sequence</h3><span class="badge">PHASE ${Math.max(1, PHASES.findIndex(([key]) => key === stateKey) + 1)}/8</span></div>
+        <div class="phase-rail">
+          ${PHASES.map(([key, label], index) => {
+            const current = PHASES.findIndex(([phase]) => phase === stateKey);
+            const status = current === index ? 'active' : current > index ? 'done' : '';
+            return `<div class="phase-step ${status}"><span class="marker">${status === 'active' ? `<span class="led ${ledFor(key)} pulse"></span>` : status === 'done' ? 'OK' : String(index + 1).padStart(2, '0')}</span><span class="name">${label}</span><span class="ts">${status === 'active' ? '...' : ''}</span></div>`;
+          }).join('')}
+        </div>
+        <div class="panel-section scroll" style="flex:1">
+          <div class="section-title"><span>Session History</span><span>${(session.history || []).length} ENTR.</span></div>
+          ${(session.history || []).map((item) => `
+            <div class="well history-item">
+              <div class="history-line"><strong class="mono">${escapeHtml(item.title || 'World')}</strong><span class="mono dim">${escapeHtml((item.at || '').slice(11, 19) || item.ts || '')}</span></div>
+              <div class="history-line" style="margin-top:5px"><span class="mono ${item.event?.includes('fallback') ? 'signal-amber' : ''}">${escapeHtml(item.event || item.state || 'ARRIVAL_OK')}</span><span class="mono dim">${fmtMs(item.timings?.imageMs || item.imageMs)}</span><span class="mono dim">$${Number(item.costEstimateUsd || item.cost || 0).toFixed(2)}</span></div>
+            </div>
+          `).join('') || '<div class="well dim mono">No prior worlds.</div>'}
+        </div>
+      </aside>
+
+      <section class="viewport-cell">
+        <canvas class="viewport-canvas" data-scene-main></canvas>
+        <div class="crosshair"></div>
+        ${['PORTAL_OPENING', 'ARRIVAL'].includes(stateKey) ? '<div class="portal-ring"></div>' : ''}
+        <div class="viewport-overlay" style="top:0;left:0"><div class="viewport-corner mono">WORLD <span>${escapeHtml(recipe.title || 'UNKNOWN DREAM').toUpperCase()}</span><div class="dim" style="font-size:9px;margin-top:2px">SEED · 0x${String((session.history?.length || 1) + 4096).toString(16).toUpperCase()}</div></div></div>
+        <div class="viewport-overlay" style="top:0;right:0;text-align:right"><div class="viewport-corner mono">FOV <span>${Number(settings.mainFov || 75).toFixed(0)}°</span> · DRIFT <span>${Number(settings.drift || 0.6).toFixed(2)}x</span><div class="dim" style="font-size:9px;margin-top:2px">FOG ${Number(settings.fog || 0).toFixed(2)} · PCL ${Math.round(Number(settings.particles || 0) * 100)}%</div></div></div>
+        ${isGenerating ? `<div class="viewport-overlay" style="right:0;bottom:0;text-align:right"><div class="viewport-corner mono"><span class="led amber pulse-fast" style="margin-right:6px"></span><span style="color:var(--signal-amber)">GENERATING</span><div class="dim" style="font-size:9px;margin-top:2px">${escapeHtml(session.provider?.image || 'local')}</div></div></div>` : ''}
+        ${isIdle ? promptOverlayMarkup() : ''}
+      </section>
+
+      <aside class="right-bay">
+        <div class="panel-header">
+          <h3>Projection Bay</h3>
+          <div class="segmented">
+            <button class="${session.layoutMode !== 'ceiling' ? 'active' : ''}" data-action="layout" data-layout="three-wall">3-Wall</button>
+            <button class="${session.layoutMode === 'ceiling' ? 'active' : ''}" data-action="layout" data-layout="ceiling">+Ceiling</button>
+          </div>
+        </div>
+        <div class="panel-section scroll" style="flex:1">
+          ${(!config.hasGemini && !config.hasOpenAI) ? '<div class="error mono" style="margin-bottom:10px">Cloud image generation is not configured. Add GEMINI_API_KEY or OPENAI_API_KEY in .env.local before starting the app, otherwise local fallback worlds are used.</div>' : ''}
+          ${projectors.map((projector) => projectorCardMarkup(projector)).join('')}
+          <div class="well" style="margin-top:10px">
+            <div class="section-title"><span>Master Output</span><span>LIVE APPLY</span></div>
+            ${sliderMarkup('Brightness', 'intensity', settings.intensity ?? 0.85, 0, 1, 0.01, `${Math.round((settings.intensity ?? 0.85) * 100)}%`, 'setting')}
+            ${sliderMarkup('Fog', 'fog', settings.fog ?? 0.42, 0, 1, 0.01, Number(settings.fog ?? 0.42).toFixed(2), 'setting')}
+            ${sliderMarkup('Particles', 'particles', settings.particles ?? 0.55, 0, 1, 0.01, `${Math.round((settings.particles ?? 0.55) * 100)}%`, 'setting')}
+          </div>
+          ${generatedWorldsMarkup()}
+        </div>
+      </aside>
+
+      <section class="bottom-pipeline">
+        <div class="panel-header"><h3>Generation Pipeline</h3><span class="badge">${session.error ? `<span style="color:var(--signal-red)">${escapeHtml(session.error)}</span>` : 'NOMINAL'}</span></div>
+        <div class="pipeline">
+          ${pipeline.map(([idx, name, status, provider, ms]) => `<div class="stage-cell ${status}"><div class="stage-head"><span class="index">${idx}</span><span class="name">${name}</span></div><div class="meta"><span>${escapeHtml(provider)}</span><span>${fmtMs(ms)}</span></div></div>`).join('')}
+        </div>
+      </section>
+
+      <footer class="transport">
+        <div class="transport-zone">
+          <button class="btn-latch ${resetArmed ? 'armed' : ''}" data-action="reset"><span class="led red ${resetArmed ? 'pulse' : ''}"></span>${resetArmed ? 'CONFIRM RESET' : 'RESET'}</button>
+          <button class="btn-latch ${stateKey === 'BLACKOUT' ? 'armed' : ''}" data-action="blackout"><span class="led red"></span>BLACKOUT</button>
+        </div>
+        <div class="transport-zone" style="justify-content:center">
+          <button class="btn ghost" data-action="overview">⊙ ${settings.overview ? 'Inside' : 'Overview'}</button>
+          <button class="btn" data-action="start" ${stateKey !== 'IDLE' && stateKey !== 'RESET' ? 'disabled' : ''}>▶ Start Session</button>
+          <button class="btn primary" data-action="generate" ${(isGenerating || generationInFlight) ? 'disabled' : ''}>⚡ Open Portal</button>
+          <button class="btn" data-action="arrival">⤴ Trigger Arrival</button>
+          <button class="btn" data-action="end">◼ End Session</button>
+          <button class="btn ghost" data-action="fallback">⏵ Skip to Fallback</button>
+        </div>
+        <div class="transport-zone">
+          <div><div class="mono dim" style="font-size:9px;text-align:right;letter-spacing:.18em;text-transform:uppercase">Audio Bus</div><div class="audio-bar">${Array.from({ length: 16 }, (_, index) => `<i data-index="${index}"></i>`).join('')}</div></div>
+        </div>
+      </footer>
+      ${stateKey === 'BLACKOUT' ? '<div class="blackout-screen"></div>' : ''}
+    </div>
+  `;
+}
+
+function generatedWorldsMarkup() {
+  const worlds = session.generatedWorlds || [];
+  return `
+    <div class="well previous-worlds">
+      <div class="section-title"><span>Previous Generations</span><span>${worlds.length} FILES</span></div>
+      <div class="world-list">
+        ${worlds.map((world) => `
+          <button class="world-row" data-action="load-world" data-file="${escapeHtml(world.name)}">
+            <span>
+              <strong>${escapeHtml(world.title || 'Generated world')}</strong>
+              <span class="mono dim">${escapeHtml(world.name)}</span>
+            </span>
+            <span class="mono dim">${escapeHtml(world.at ? new Date(world.at).toLocaleDateString() : '')}</span>
+          </button>
+        `).join('') || '<div class="dim mono">No saved generations yet.</div>'}
+      </div>
+    </div>
+  `;
+}
+
+function promptOverlayMarkup() {
+  const listening = session.state?.key === 'LISTENING';
+  return `
+    <div class="prompt-overlay">
+      <div class="prompt-card">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+          <span class="uc muted">Visitor Prompt</span>
+          ${listening ? `<span class="mono" style="font-size:10px;color:var(--signal-cyan);letter-spacing:.18em"><span class="led cyan pulse-fast" style="margin-right:8px"></span>LISTENING</span>` : ''}
+        </div>
+        <textarea class="prompt" id="prompt-input" rows="3" placeholder="Where do you want to go?">${escapeHtml(promptValue)}</textarea>
+        <div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">
+          <button class="btn" data-action="listen"><span class="led cyan"></span>${listening ? 'Capture' : 'Open Mic'}</button>
+      <button class="btn primary" data-action="generate" ${generationInFlight ? 'disabled' : ''}>⚡ Open Portal</button>
+        </div>
+        <div style="margin-top:12px;font-size:11px;color:var(--fg-4);display:flex;justify-content:space-between"><span><span class="kbd">⌘</span><span class="kbd">↵</span> generate</span><span class="mono">${promptValue.length} chars</span></div>
+      </div>
+    </div>
+  `;
+}
+
+function projectorCardMarkup(projector) {
+  return `
+    <div class="proj-card ${selectedProjectorId === projector.id ? 'active' : ''}" data-projector-card="${projector.id}">
+      <div class="proj-head">
+        <span class="led" style="background:${colorToCss(projector.color)};box-shadow:0 0 8px ${colorToCss(projector.color, .7)}"></span>
+        <div><strong class="mono">${escapeHtml(projector.label)}</strong><div class="mono dim" style="font-size:9px;margin-top:2px">${escapeHtml(projector.signal)}</div></div>
+        <button class="toggle ${projector.live ? 'on' : ''}" data-action="projector-toggle" data-id="${projector.id}" title="Live to projector"></button>
+      </div>
+      <div class="proj-preview no-webgl"><div class="mono">${escapeHtml(projector.outputSlot || projector.id)} · ${projector.live ? 'LIVE' : 'MUTED'}</div></div>
+      <div class="proj-controls">
+        ${sliderMarkup('Yaw', 'yaw', projector.yaw, -Math.PI, Math.PI, 0.005, `${(projector.yaw * 180 / Math.PI).toFixed(1)}°`, 'projector', projector.id)}
+        ${sliderMarkup('Pitch', 'pitch', projector.pitch, -Math.PI / 2, Math.PI / 2, 0.005, `${(projector.pitch * 180 / Math.PI).toFixed(1)}°`, 'projector', projector.id)}
+        ${sliderMarkup('FOV', 'fov', projector.fov, 20, 120, 1, `${Math.round(projector.fov)}°`, 'projector', projector.id)}
+      </div>
+    </div>
+  `;
+}
+
+function sceneBuilderMarkup() {
+  const settings = session.sceneSettings || {};
+  const builder = session.sceneBuilder || {};
+  const cameras = normalizeSceneCameras(builder.cameras);
+  const mappings = session.outputMappings || {};
+  const selected = cameras.find((camera) => camera.id === selectedProjectorId || camera.id === builder.selectedCameraId) || cameras[0];
+  selectedProjectorId = selected?.id || 'F';
+  const depthMode = builder.depthMode || settings.worldMode || 'single';
+  return `
+    <div class="main">
+      <aside class="left-rail">
+        <div class="panel-header"><h3>Virtual Cameras</h3><button class="btn sm primary" data-action="add-camera">+ Add</button></div>
+        <div class="scroll" style="flex:1">
+          ${cameras.map((camera) => `
+            <button class="projector-row ${selectedProjectorId === camera.id ? 'active' : ''}" data-action="select-camera" data-id="${camera.id}">
+              <span class="led" style="background:${colorToCss(camera.color)};box-shadow:0 0 8px ${colorToCss(camera.color, .7)}"></span>
+              <span><strong>${escapeHtml(camera.label)}</strong><span class="mono dim" style="display:block;font-size:9px;margin-top:2px">${escapeHtml(camera.outputSlot || camera.signal || 'planning camera')}</span></span>
+              <span class="led ${camera.live ? 'green' : ''}"></span>
+            </button>
+          `).join('')}
+        </div>
+        <div class="panel-section" style="margin-top:auto">
+          <div class="section-title"><span>Room Preset</span><span>JSON</span></div>
+          <input type="text" id="preset-name" value="take-me-there-room.json" />
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px">
+            <button class="btn sm" data-action="save-preset">⤓ Save</button>
+            <button class="btn sm ghost" data-action="load-preset">⤒ Load</button>
+          </div>
+        </div>
+      </aside>
+
+      <section class="viewport-cell">
+        <canvas class="viewport-canvas" data-scene-main></canvas>
+        <div class="viewport-overlay" style="top:0;left:0"><div class="viewport-corner mono"><span style="color:var(--signal-violet)">SCENE BUILDER · ${builder.mainView?.overview ? 'OVERVIEW' : 'INSIDE'}</span><div class="dim" style="font-size:9px;margin-top:2px">shared sphere-world scene · ${cameras.length} cameras</div></div></div>
+        <div class="viewport-overlay" style="top:0;right:0;text-align:right"><div class="viewport-corner mono">WORLD <span>${escapeHtml(depthMode).toUpperCase()}</span><div class="dim" style="font-size:9px;margin-top:2px">R=500 · frustum rectangles on panorama</div></div></div>
+        <div class="viewport-overlay" style="bottom:12px;right:12px;pointer-events:auto"><button class="btn sm ${builder.mainView?.overview ? 'primary' : ''}" data-action="overview">⊙ Overview</button> <button class="btn sm" data-action="test-pattern">⊞ ${depthMode === 'test' ? 'World Image' : 'Test Grid'}</button></div>
+      </section>
+
+      <aside class="right-bay">
+        <div class="panel-header"><h3>Camera Controls</h3><span class="badge">${escapeHtml(selected?.label || '')}</span></div>
+        <div class="panel-section scroll" style="flex:1">
+          <div class="section-title"><span>Selected Camera</span><span>${escapeHtml(selected?.orientation || 'landscape').toUpperCase()}</span></div>
+          <div class="well mono" style="margin-bottom:10px;color:var(--fg-3)">Monitor canvas renders in the bottom bay from the same shared scene.</div>
+          ${selected ? cameraControlsMarkup(selected) : ''}
+          <div class="panel-section" style="padding-left:0;padding-right:0">
+            <div class="section-title"><span>Output Mapping</span><span>Physical Slots</span></div>
+            ${['left', 'front', 'right', 'ceiling'].map((slot) => `
+              <div class="slider-row output-map-row" style="grid-template-columns:74px 1fr">
+                <span class="label">${slot}</span>
+                <select data-action="output-map" data-slot="${slot}">
+                  <option value="">Unmapped</option>
+                  ${cameras.map((camera) => `<option value="${escapeHtml(camera.id)}" ${mappings[slot] === camera.id ? 'selected' : ''}>${escapeHtml(camera.label)}</option>`).join('')}
+                </select>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+      </aside>
+
+      <section class="bottom-pipeline">
+        <div class="panel-header"><h3>Monitor Canvas Bay</h3><span class="badge">ONE RENDERER PER CAMERA · WORLD LAYER ONLY</span></div>
+        <div class="monitor-bottom" data-monitor-root>
+          ${cameras.map((camera) => `
+            <button class="monitor-card ${camera.orientation === 'portrait' ? 'portrait' : ''} ${selectedProjectorId === camera.id ? 'active' : ''}" data-action="select-camera" data-id="${camera.id}">
+              <span class="monitor-title"><span class="led" style="background:${colorToCss(camera.color)}"></span>${escapeHtml(camera.label)}</span>
+              <canvas data-monitor-canvas="${camera.id}"></canvas>
+              <span class="monitor-meta mono">${escapeHtml(camera.orientation === 'portrait' ? '9:16' : '16:9')} · ${escapeHtml(camera.outputSlot || 'planning')}</span>
+            </button>
+          `).join('')}
+        </div>
+      </section>
+
+      <footer class="transport scene-transport">
+        <div class="transport-zone"><button class="btn ghost" data-action="recenter">⊙ Recenter Main</button><button class="btn ghost" data-action="remove-camera" data-id="${escapeHtml(selectedProjectorId)}">Remove Selected</button></div>
+        <div class="transport-zone" style="justify-content:center">
+          <div class="stage-cell">
+            <div class="stage-head"><span class="index">A</span><span class="name">Render Mode</span></div>
+            <div class="segmented">
+              ${['single', 'depth', 'test'].map((mode) => `<button class="${depthMode === mode ? 'active' : ''}" data-action="world-mode" data-mode="${mode}">${mode}</button>`).join('')}
+            </div>
+          </div>
+          <button class="btn ghost" data-action="test-pattern">⊞ Toggle test pattern</button>
+          <button class="btn" data-action="surface" data-surface="live">✓ Save & Return to Live</button>
+        </div>
+        <div class="transport-zone"><button class="btn primary" data-action="focus-output">Focus Output</button></div>
+      </footer>
+    </div>
+  `;
+}
+
+function cameraControlsMarkup(projector) {
+  return `
+    <div class="panel-section" style="padding-left:0;padding-right:0">
+      <div class="section-title"><span>Identity</span></div>
+      <div style="display:grid;grid-template-columns:1fr auto;gap:8px">
+        <input type="text" value="${escapeHtml(projector.label)}" data-camera-text="${projector.id}" data-key="label" />
+        <button class="btn sm ghost" data-action="camera-orientation" data-id="${projector.id}">${projector.orientation === 'portrait' ? '9:16' : '16:9'}</button>
+      </div>
+    </div>
+    <div class="panel-section" style="padding-left:0;padding-right:0">
+      <div class="section-title"><span>Aim</span></div>
+      <div class="knobs">
+        ${knobMarkup('Yaw', `${(projector.yaw * 180 / Math.PI).toFixed(1)}°`, projector.yaw * 180 / Math.PI)}
+        ${knobMarkup('Pitch', `${(projector.pitch * 180 / Math.PI).toFixed(1)}°`, projector.pitch * 180 / Math.PI * 2)}
+        ${knobMarkup('FOV', `${Math.round(projector.fov)}°`, (projector.fov - 70) * 5)}
+      </div>
+      ${sliderMarkup('Yaw', 'yaw', projector.yaw, -Math.PI, Math.PI, 0.005, `${(projector.yaw * 180 / Math.PI).toFixed(1)}°`, 'camera', projector.id)}
+      ${sliderMarkup('Pitch', 'pitch', projector.pitch, -Math.PI / 2, Math.PI / 2, 0.005, `${(projector.pitch * 180 / Math.PI).toFixed(1)}°`, 'camera', projector.id)}
+      ${sliderMarkup('FOV', 'fov', projector.fov, 20, 130, 1, `${Math.round(projector.fov)}°`, 'camera', projector.id)}
+    </div>
+    <div class="panel-section" style="padding-left:0;padding-right:0">
+      <div class="section-title"><span>Offset</span></div>
+      ${sliderMarkup('Delta X', 'offX', projector.offX, -300, 300, 1, `${Math.round(projector.offX)}`, 'camera', projector.id)}
+      ${sliderMarkup('Delta Y', 'offY', projector.offY, -300, 300, 1, `${Math.round(projector.offY)}`, 'camera', projector.id)}
+      ${sliderMarkup('Delta Z', 'offZ', projector.offZ, -300, 300, 1, `${Math.round(projector.offZ)}`, 'camera', projector.id)}
+    </div>
+    <div class="panel-section" style="padding-left:0;padding-right:0">
+      <div class="section-title"><span>Output</span></div>
+      <div class="slider-row" style="grid-template-columns:1fr auto"><span class="label">Live to output</span><button class="toggle ${projector.live ? 'on' : ''}" data-action="camera-toggle" data-id="${projector.id}"></button></div>
+      <div style="margin-top:10px"><span class="label uc dim" style="display:block;margin-bottom:6px">Signal</span><input type="text" value="${escapeHtml(projector.signal)}" data-camera-text="${projector.id}" data-key="signal" /></div>
+    </div>
+  `;
+}
+
+function knobMarkup(label, value, rot) {
+  const pos = Math.max(0, Math.min(270, 135 + rot));
+  return `<div class="knob-row"><div class="knob" style="--knob-pos:${pos}deg"></div><div class="label">${label}</div><div class="value">${value}</div></div>`;
+}
+
+function sliderMarkup(label, key, value, min, max, step, display, kind, id = '') {
+  return `<div class="slider-row"><span class="label">${label}</span><input type="range" min="${min}" max="${max}" step="${step}" value="${value}" data-slider-kind="${kind}" data-key="${key}" data-id="${id}" /><span class="value">${display}</span></div>`;
+}
+
+function updateSliderDisplay(input) {
+  const valueNode = input.parentElement?.querySelector('.value');
+  if (!valueNode) return;
+  const key = input.dataset.key;
+  const value = Number(input.value);
+  if (key === 'yaw' || key === 'pitch') valueNode.textContent = `${(value * 180 / Math.PI).toFixed(1)}°`;
+  else if (key === 'fov') valueNode.textContent = `${Math.round(value)}°`;
+  else if (['intensity', 'particles'].includes(key)) valueNode.textContent = `${Math.round(value * 100)}%`;
+  else if (key === 'fog' || key === 'drift') valueNode.textContent = value.toFixed(2);
+  else valueNode.textContent = `${Math.round(value)}`;
+}
+
+function hydrateCanvases() {
+  const mainCanvas = document.querySelector('[data-scene-main]');
+  if (mainCanvas) {
+    if (surface === 'scene') {
+      const renderer = new SphereWorldSceneBuilder(mainCanvas, document.querySelector('[data-monitor-root]') || surfaceRoot, {
+        host: mainCanvas.parentElement,
+        onCameraChange: (id, patch) => api.updateSceneCamera(id, patch),
+        onSelectCamera: (id) => {
+          if (!id) return;
+          selectedProjectorId = id;
+          api.updateSceneBuilder({ selectedCameraId: id });
+        },
+        onMainViewChange: (mainView) => api.updateSceneBuilder({ mainView })
+      });
+      renderer.updateConfig({
+        cameras: session.sceneBuilder?.cameras,
+        sceneBuilder: session.sceneBuilder,
+        selectedId: selectedProjectorId
+      });
+      if (session.sceneBuilder?.depthMode === 'test') renderer.setTestPattern(session.sceneSettings?.testPattern || 'grid');
+      else renderer.setImageDataUrl(session.imageDataUrl, session.recipe?.palette, session.history?.length || 1);
+      renderers.push(renderer);
+    } else {
+      const renderer = new SphereWorldRenderer(mainCanvas, {
+        host: mainCanvas.parentElement,
+        mode: 'main',
+        showGizmos: false
+      });
+      renderer.updateConfig({
+        projectors: session.projectors,
+        sceneSettings: { ...session.sceneSettings, overview: false },
+        layoutMode: session.layoutMode,
+        selectedId: selectedProjectorId,
+        onProjectorChange: (id, patch) => api.updateProjector(id, patch)
+      });
+      if (session.sceneSettings?.outputTestMode || session.sceneSettings?.worldMode === 'test') renderer.setTestPattern(session.sceneSettings?.testPattern || 'grid');
+      else renderer.setImageDataUrl(session.imageDataUrl, session.recipe?.palette, session.history?.length || 1);
+      renderers.push(renderer);
+    }
+  }
+
+  if (surface === 'scene') return;
+
+  // Live Console keeps projector cards lightweight. Scene Builder owns the per-camera monitor WebGL renderers.
+}
+
+async function doGenerate() {
+  if (generationInFlight) return;
+  const prompt = document.querySelector('#prompt-input')?.value || promptValue;
+  promptValue = prompt.trim() || promptValue;
+  missionStart ||= Date.now();
+  audio.start('mechanical');
+  generationInFlight = true;
+  render(true);
+  await api.generateWorld(promptValue);
 }
 
 function startSpeechRecognition() {
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SpeechRecognition) {
-    els.errorSlot.innerHTML = '<div class="error">Microphone transcription is not available in this runtime. Type the prompt manually.</div>';
+    alert('Microphone transcription is not available in this runtime. Type the prompt manually.');
     return;
   }
   const recognition = new SpeechRecognition();
@@ -90,9 +601,193 @@ function startSpeechRecognition() {
   api.setState('LISTENING');
   recognition.onresult = (event) => {
     const transcript = Array.from(event.results).map((result) => result[0]?.transcript || '').join(' ').trim();
-    if (transcript) els.prompt.value = transcript;
+    if (transcript) {
+      promptValue = transcript;
+      const input = document.querySelector('#prompt-input');
+      if (input) input.value = transcript;
+    }
   };
-  recognition.onerror = () => { els.errorSlot.innerHTML = '<div class="error">Transcription failed. Type the prompt manually.</div>'; };
-  recognition.onend = () => { if (els.prompt.value.trim()) api.generateWorld(els.prompt.value); };
+  recognition.onend = () => { if (promptValue.trim()) doGenerate(); };
+  recognition.onerror = () => alert('Transcription failed. Type the prompt manually.');
   recognition.start();
 }
+
+function savePreset() {
+  const preset = {
+    version: 1,
+    depth: session.sceneBuilder?.depthMode === 'depth',
+    depthMode: session.sceneBuilder?.depthMode || 'single',
+    overview: !!session.sceneBuilder?.mainView?.overview,
+    layoutMode: session.layoutMode,
+    sceneSettings: session.sceneSettings,
+    main: session.sceneBuilder?.mainView || { fov: session.sceneSettings?.mainFov || 75, yaw: 0, pitch: 0, pos: [0, 0, 0] },
+    cameras: session.sceneBuilder?.cameras || session.projectors,
+    outputMappings: session.outputMappings || {}
+  };
+  const blob = new Blob([JSON.stringify(preset, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = document.querySelector('#preset-name')?.value || `take-me-there-room-${Date.now()}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function loadPreset() {
+  if (!fileInput) {
+    fileInput = document.createElement('input');
+    fileInput.type = 'file';
+    fileInput.accept = 'application/json,.json';
+    fileInput.addEventListener('change', async () => {
+      const file = fileInput.files?.[0];
+      if (!file) return;
+      try {
+        const preset = JSON.parse(await file.text());
+        await api.applyPreset(preset);
+      } catch (error) {
+        alert(`Could not load preset: ${error.message}`);
+      } finally {
+        fileInput.value = '';
+      }
+    });
+  }
+  fileInput.click();
+}
+
+surfaceRoot.addEventListener('input', (event) => {
+  const target = event.target;
+  if (target.id === 'prompt-input') {
+    promptValue = target.value;
+    return;
+  }
+  if (target.dataset.sliderKind === 'setting') {
+    updateSliderDisplay(target);
+    api.updateSceneSettings({ [target.dataset.key]: Number(target.value) });
+  } else if (target.dataset.sliderKind === 'projector') {
+    updateSliderDisplay(target);
+    api.updateProjector(target.dataset.id, { [target.dataset.key]: Number(target.value) });
+  } else if (target.dataset.sliderKind === 'camera') {
+    updateSliderDisplay(target);
+    api.updateSceneCamera(target.dataset.id, { [target.dataset.key]: Number(target.value) });
+  } else if (target.dataset.projectorText) {
+    api.updateProjector(target.dataset.projectorText, { [target.dataset.key]: target.value });
+  } else if (target.dataset.cameraText) {
+    api.updateSceneCamera(target.dataset.cameraText, { [target.dataset.key]: target.value });
+  } else if (target.dataset.action === 'test-select') {
+    api.updateSceneSettings({ testPattern: target.value });
+  } else if (target.dataset.action === 'output-map') {
+    api.setOutputMapping(target.dataset.slot, target.value);
+  }
+});
+
+surfaceRoot.addEventListener('change', (event) => {
+  const target = event.target;
+  if (target.dataset.action === 'output-map') {
+    api.setOutputMapping(target.dataset.slot, target.value);
+  } else if (target.dataset.action === 'test-select') {
+    api.updateSceneSettings({ testPattern: target.value });
+  }
+});
+
+surfaceRoot.addEventListener('click', async (event) => {
+  const button = event.target.closest('button, [data-projector-card]');
+  if (!button) return;
+  const action = button.dataset.action;
+  if (!action && button.dataset.projectorCard) {
+    selectedProjectorId = button.dataset.projectorCard;
+    api.updateSceneSettings({ selectedProjectorId });
+    render(true);
+    return;
+  }
+  if (action === 'surface') setSurface(button.dataset.surface);
+  else if (action === 'layout') await api.setLayout(button.dataset.layout);
+  else if (action === 'start') { missionStart = Date.now(); await api.setState('LISTENING'); }
+  else if (action === 'listen') startSpeechRecognition();
+  else if (action === 'generate') doGenerate();
+  else if (action === 'arrival') await api.setState('ARRIVAL');
+  else if (action === 'end') { await api.setState('EXIT'); setTimeout(() => api.setState('IDLE'), 1800); }
+  else if (action === 'fallback') { missionStart ||= Date.now(); await api.fallbackWorld(promptValue); }
+  else if (action === 'load-world') { missionStart ||= Date.now(); await api.loadGeneratedWorld(button.dataset.file); }
+  else if (action === 'blackout') { audio.mute(); await api.setState('BLACKOUT'); }
+  else if (action === 'reset') {
+    if (!resetArmed) {
+      resetArmed = true;
+      render(true);
+      setTimeout(() => { resetArmed = false; render(true); }, 3000);
+    } else {
+      resetArmed = false;
+      missionStart = null;
+      audio.mute();
+      await api.setState('RESET');
+    }
+  } else if (action === 'overview') {
+    const overview = surface === 'scene' ? !session.sceneBuilder?.mainView?.overview : !session.sceneSettings?.overview;
+    if (surface === 'scene') await api.updateSceneBuilder({ mainView: { ...(session.sceneBuilder?.mainView || {}), overview } });
+    else await api.updateSceneSettings({ overview });
+  } else if (action === 'projector-toggle') {
+    const projector = session.projectors.find((item) => item.id === button.dataset.id);
+    if (projector) await api.updateProjector(projector.id, { live: !projector.live });
+  } else if (action === 'camera-toggle') {
+    const camera = session.sceneBuilder?.cameras?.find((item) => item.id === button.dataset.id);
+    if (camera) await api.updateSceneCamera(camera.id, { live: !camera.live });
+  } else if (action === 'select-projector') {
+    selectedProjectorId = button.dataset.id;
+    await api.updateSceneSettings({ selectedProjectorId });
+  } else if (action === 'select-camera') {
+    selectedProjectorId = button.dataset.id;
+    await api.updateSceneBuilder({ selectedCameraId: selectedProjectorId });
+  } else if (action === 'add-camera') {
+    await api.addSceneCamera();
+  } else if (action === 'remove-camera') {
+    await api.removeSceneCamera(button.dataset.id);
+  } else if (action === 'camera-orientation') {
+    const camera = session.sceneBuilder?.cameras?.find((item) => item.id === button.dataset.id);
+    if (camera) await api.updateSceneCamera(camera.id, { orientation: camera.orientation === 'portrait' ? 'landscape' : 'portrait' });
+  } else if (action === 'world-mode') {
+    if (surface === 'scene') await api.updateSceneBuilder({ depthMode: button.dataset.mode });
+    else await api.updateSceneSettings({ worldMode: button.dataset.mode, outputTestMode: button.dataset.mode === 'test' });
+  } else if (action === 'test-pattern') {
+    if (surface === 'scene') await api.updateSceneBuilder({ depthMode: session.sceneBuilder?.depthMode === 'test' ? 'single' : 'test' });
+    else await api.updateSceneSettings({ outputTestMode: !session.sceneSettings?.outputTestMode, worldMode: session.sceneSettings?.outputTestMode ? 'single' : 'test' });
+  } else if (action === 'save-preset') savePreset();
+  else if (action === 'load-preset') loadPreset();
+  else if (action === 'reset-projectors') await api.setProjectors(DEFAULT_PROJECTORS);
+  else if (action === 'recenter') {
+    if (surface === 'scene') await api.updateSceneBuilder({ mainView: { yaw: 0, pitch: 0, fov: 75, pos: [0, 0, 0], overview: !!session.sceneBuilder?.mainView?.overview } });
+    else for (const projector of session.projectors) await api.updateProjector(projector.id, { offX: 0, offY: 0, offZ: 0 });
+  } else if (action === 'focus-output') api.focusOutput();
+});
+
+topbar.addEventListener('click', (event) => {
+  const button = event.target.closest('button[data-action="surface"]');
+  if (!button) return;
+  setSurface(button.dataset.surface);
+});
+
+document.addEventListener('keydown', (event) => {
+  if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+    event.preventDefault();
+    doGenerate();
+  }
+});
+
+api.onSessionUpdate((nextSession) => {
+  const previousState = session?.state?.key;
+  session = nextSession;
+  surface = nextSession.sceneSettings?.surface || surface;
+  selectedProjectorId = surface === 'scene' ? (nextSession.sceneBuilder?.selectedCameraId || selectedProjectorId) : (nextSession.sceneSettings?.selectedProjectorId || selectedProjectorId);
+  if (nextSession.transcript) promptValue = nextSession.transcript;
+  if (previousState !== nextSession.state?.key) {
+    if (['PORTAL_OPENING', 'ARRIVAL', 'WORLD_ACTIVE'].includes(nextSession.state?.key)) audio.start(nextSession.recipe?.sound_style || 'dream');
+    if (['EXIT', 'RESET', 'BLACKOUT', 'IDLE'].includes(nextSession.state?.key)) audio.mute();
+  }
+  if (!['UNDERSTANDING', 'GENERATING'].includes(nextSession.state?.key)) generationInFlight = false;
+  render();
+});
+
+api.getSession().then((initialSession) => {
+  session = initialSession;
+  surface = initialSession.sceneSettings?.surface || 'live';
+  selectedProjectorId = surface === 'scene' ? (initialSession.sceneBuilder?.selectedCameraId || 'F') : (initialSession.sceneSettings?.selectedProjectorId || 'F');
+  promptValue = initialSession.transcript || promptValue;
+  render();
+});
