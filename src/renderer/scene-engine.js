@@ -284,6 +284,22 @@ async function textureFromImageDataUrl(imageDataUrl) {
   return textureFromCanvas(canvas);
 }
 
+async function textureFromRawImageDataUrl(imageDataUrl) {
+  const image = await new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = imageDataUrl;
+  });
+  const texture = new THREE.Texture(image);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.minFilter = THREE.LinearFilter;
+  texture.magFilter = THREE.LinearFilter;
+  texture.generateMipmaps = false;
+  texture.needsUpdate = true;
+  return texture;
+}
+
 function cloneCanvasTexture(baseCanvas, layer) {
   const canvas = document.createElement('canvas');
   canvas.width = baseCanvas.width;
@@ -1210,6 +1226,407 @@ export class SphereWorldSceneBuilder {
     this.axesHelper.geometry.dispose();
     this.mainRenderer.renderLists.dispose();
     this.mainRenderer.dispose();
+  }
+}
+
+function disposeObjectTree(object) {
+  object.traverse((child) => {
+    if (child.geometry) child.geometry.dispose();
+    if (child.material) {
+      const materials = Array.isArray(child.material) ? child.material : [child.material];
+      for (const material of materials) material.dispose();
+    }
+  });
+}
+
+export class MappingRoomRenderer {
+  constructor(canvas, options = {}) {
+    this.canvas = canvas;
+    this.host = options.host || canvas.parentElement;
+    this.onMappingRoomChange = options.onMappingRoomChange;
+    this.onObjectChange = options.onObjectChange;
+    this.onSelectObject = options.onSelectObject;
+    this.mappingRoom = {};
+    this.projectors = [];
+    this.roomObjects = new Map();
+    this.photoObjects = new Map();
+    this.photoTextures = new Map();
+    this.projectorObjects = new Map();
+    this.pickables = [];
+    this.itemById = new Map();
+    this.running = true;
+    this.draggingTransform = false;
+    this.pointerDownAt = null;
+    this.controlsDisposers = [];
+
+    this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color(0x05070b);
+    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, options.maxPixelRatio || 2));
+    this.renderer.autoClear = true;
+
+    this.camera = new THREE.PerspectiveCamera(55, 1, 0.1, 6000);
+    this.camera.position.set(0, 260, 620);
+    this.camera.layers.enableAll();
+    this.scene.add(this.camera);
+
+    this.orbit = new OrbitControls(this.camera, this.canvas);
+    this.orbit.target.set(0, 110, -80);
+    this.orbit.enableDamping = true;
+    this.orbit.dampingFactor = 0.08;
+    this.orbit.rotateSpeed = 0.54;
+    this.orbit.zoomSpeed = 0.9;
+    this.orbit.minDistance = 80;
+    this.orbit.maxDistance = 1800;
+
+    this.transform = new TransformControls(this.camera, this.canvas);
+    this.transform.setSpace('world');
+    this.transform.size = 0.76;
+    this.transformHelper = typeof this.transform.getHelper === 'function' ? this.transform.getHelper() : this.transform;
+    this.transformHelper.traverse((child) => child.layers.set(LAYER_GIZMO));
+    this.scene.add(this.transformHelper);
+
+    this.roomRoot = new THREE.Group();
+    this.photoRoot = new THREE.Group();
+    this.projectorRoot = new THREE.Group();
+    this.scene.add(this.roomRoot, this.photoRoot, this.projectorRoot);
+
+    this.grid = new THREE.GridHelper(640, 32, 0x2a3447, 0x1c2434);
+    this.grid.material.transparent = true;
+    this.grid.material.opacity = 0.72;
+    this.scene.add(this.grid);
+    this.axes = new THREE.AxesHelper(80);
+    this.axes.layers.set(LAYER_GIZMO);
+    this.scene.add(this.axes);
+
+    this.worldTexture = createFallbackPanoramaTexture();
+    this.testTexture = createTestPatternTexture('grid');
+    this.bodyGeo = new THREE.IcosahedronGeometry(7, 1);
+    this.setupControls();
+    this.resizeObserver = new ResizeObserver(() => this.resize());
+    this.resizeObserver.observe(this.host);
+    this.resize();
+    this.animate = this.animate.bind(this);
+    this.raf = requestAnimationFrame(this.animate);
+  }
+
+  setupControls() {
+    const raycaster = new THREE.Raycaster();
+    const ndc = new THREE.Vector2();
+    const add = (target, type, listener, options) => {
+      target.addEventListener(type, listener, options);
+      this.controlsDisposers.push(() => target.removeEventListener(type, listener, options));
+    };
+
+    this.orbit.addEventListener('change', () => this.emitMainView());
+    this.transform.addEventListener('dragging-changed', (event) => {
+      this.draggingTransform = event.value;
+      this.orbit.enabled = !event.value;
+      if (!event.value) this.emitSelectedTransform();
+    });
+    this.transform.addEventListener('change', () => {
+      this.transformHelper.traverse((child) => child.layers.set(LAYER_GIZMO));
+      if (this.draggingTransform) this.emitSelectedTransform();
+    });
+
+    add(this.canvas, 'pointerdown', (event) => {
+      this.pointerDownAt = { x: event.clientX, y: event.clientY, button: event.button };
+    });
+    add(this.canvas, 'pointerup', (event) => {
+      if (!this.pointerDownAt) return;
+      const moved = Math.hypot(event.clientX - this.pointerDownAt.x, event.clientY - this.pointerDownAt.y);
+      const wasLeft = this.pointerDownAt.button === 0;
+      this.pointerDownAt = null;
+      if (!wasLeft || moved > 4 || this.transform.axis !== null) return;
+      const rect = this.canvas.getBoundingClientRect();
+      ndc.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      ndc.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(ndc, this.camera);
+      const hits = raycaster.intersectObjects(this.pickables, false);
+      const id = hits[0]?.object?.userData?.mappingId || '';
+      if (id && this.onSelectObject) this.onSelectObject(id);
+    });
+    add(window, 'keydown', (event) => {
+      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLSelectElement) return;
+      const key = event.key.toLowerCase();
+      if (key === 't') this.transform.setMode('translate');
+      else if (key === 'r') this.transform.setMode('rotate');
+      else if (key === 's') this.transform.setMode('scale');
+    });
+  }
+
+  emitMainView() {
+    if (!this.onMappingRoomChange) return;
+    this.onMappingRoomChange({
+      mainView: {
+        pos: [this.camera.position.x, this.camera.position.y, this.camera.position.z],
+        target: [this.orbit.target.x, this.orbit.target.y, this.orbit.target.z],
+        fov: this.camera.fov
+      }
+    });
+  }
+
+  emitSelectedTransform() {
+    if (!this.onObjectChange || !this.mappingRoom?.selectedObjectId) return;
+    const object = this.roomObjects.get(this.mappingRoom.selectedObjectId);
+    const item = this.itemById.get(this.mappingRoom.selectedObjectId);
+    if (!object || item?.locked) return;
+    this.onObjectChange(this.mappingRoom.selectedObjectId, {
+      x: Math.round(object.position.x),
+      y: Math.round(object.position.y),
+      z: Math.round(object.position.z),
+      rotX: object.rotation.x,
+      rotY: object.rotation.y,
+      rotZ: object.rotation.z
+    });
+  }
+
+  updateConfig({ mappingRoom, projectors, onMappingRoomChange, onObjectChange, onSelectObject } = {}) {
+    if (onMappingRoomChange) this.onMappingRoomChange = onMappingRoomChange;
+    if (onObjectChange) this.onObjectChange = onObjectChange;
+    if (onSelectObject) this.onSelectObject = onSelectObject;
+    this.mappingRoom = mappingRoom || {};
+    this.projectors = normalizeSceneCameras(projectors || []);
+    const view = this.mappingRoom.mainView || {};
+    const pos = Array.isArray(view.pos) ? view.pos : [0, 260, 620];
+    const target = Array.isArray(view.target) ? view.target : [0, 110, -80];
+    if (!this.draggingTransform) {
+      this.camera.position.set(Number(pos[0] || 0), Number(pos[1] || 260), Number(pos[2] || 620));
+      this.orbit.target.set(Number(target[0] || 0), Number(target[1] || 110), Number(target[2] || -80));
+    }
+    this.camera.fov = Number(view.fov || 55);
+    this.camera.updateProjectionMatrix();
+    if (!this.draggingTransform) {
+      this.syncRoomObjects();
+      this.syncReferencePhotos();
+    }
+    this.syncProjectors();
+    if (!this.draggingTransform) this.attachTransform();
+  }
+
+  materialForItem(item) {
+    const opacity = Number(item.opacity ?? 0.82);
+    const transparent = opacity < 1 || item.materialMode === 'transparent' || item.materialMode === 'mask';
+    if (item.materialMode === 'world') {
+      return new THREE.MeshBasicMaterial({ map: this.worldTexture, side: THREE.DoubleSide, transparent, opacity });
+    }
+    if (item.materialMode === 'test') {
+      return new THREE.MeshBasicMaterial({ map: this.testTexture, side: THREE.DoubleSide, transparent, opacity });
+    }
+    if (item.materialMode === 'mask') {
+      return new THREE.MeshBasicMaterial({ color: 0xff5a4d, side: THREE.DoubleSide, transparent: true, opacity: Math.max(0.18, opacity * 0.72) });
+    }
+    if (item.materialMode === 'transparent') {
+      return new THREE.MeshBasicMaterial({ color: item.role === 'surface' ? 0x5cd3ff : 0xa87fff, side: THREE.DoubleSide, transparent: true, opacity: Math.max(0.08, opacity * 0.36), wireframe: true });
+    }
+    return new THREE.MeshBasicMaterial({ color: Number(item.color || 0xa87fff), side: THREE.DoubleSide, transparent, opacity });
+  }
+
+  createObjectForItem(item) {
+    const group = new THREE.Group();
+    group.userData.mappingId = item.id;
+    group.position.set(item.x || 0, item.y || 0, item.z || 0);
+    group.rotation.set(item.rotX || 0, item.rotY || 0, item.rotZ || 0, 'YXZ');
+    group.visible = item.visible !== false;
+    const material = this.materialForItem(item);
+
+    const addMesh = (geometry, position = [0, 0, 0]) => {
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.position.set(position[0], position[1], position[2]);
+      mesh.userData.mappingId = item.id;
+      mesh.layers.set(LAYER_WORLD);
+      group.add(mesh);
+      this.pickables.push(mesh);
+      return mesh;
+    };
+
+    if (item.shape === 'box') {
+      addMesh(new THREE.BoxGeometry(item.width || 80, item.height || 100, item.depth || 80));
+    } else if (item.shape === 'cylinder') {
+      addMesh(new THREE.CylinderGeometry(item.radius || 45, item.radius || 45, item.height || 120, 40, 1, false));
+    } else if (item.shape === 'frame') {
+      const w = item.width || 110;
+      const h = item.height || 210;
+      const t = Math.max(4, item.depth || 12);
+      const d = Math.max(4, t * 0.8);
+      addMesh(new THREE.BoxGeometry(w, t, d), [0, h / 2 - t / 2, 0]);
+      addMesh(new THREE.BoxGeometry(w, t, d), [0, -h / 2 + t / 2, 0]);
+      addMesh(new THREE.BoxGeometry(t, h, d), [-w / 2 + t / 2, 0, 0]);
+      addMesh(new THREE.BoxGeometry(t, h, d), [w / 2 - t / 2, 0, 0]);
+    } else {
+      addMesh(new THREE.PlaneGeometry(item.width || 100, item.height || 100, 12, 8));
+    }
+
+    const edges = new THREE.BoxHelper(group, item.id === this.mappingRoom.selectedObjectId ? 0xffb547 : item.role === 'mask' ? 0xff5a4d : 0x5cd3ff);
+    edges.userData.mappingId = item.id;
+    edges.layers.set(LAYER_GIZMO);
+    group.add(edges);
+    return group;
+  }
+
+  syncRoomObjects() {
+    for (const object of this.roomObjects.values()) {
+      this.roomRoot.remove(object);
+      disposeObjectTree(object);
+    }
+    this.roomObjects.clear();
+    this.pickables = [];
+    this.itemById.clear();
+    const items = [
+      ...(this.mappingRoom.surfaces || []),
+      ...(this.mappingRoom.objects || []),
+      ...(this.mappingRoom.masks || [])
+    ];
+    for (const item of items) {
+      this.itemById.set(item.id, item);
+      const object = this.createObjectForItem(item);
+      this.roomRoot.add(object);
+      this.roomObjects.set(item.id, object);
+    }
+  }
+
+  syncReferencePhotos() {
+    for (const object of this.photoObjects.values()) {
+      this.photoRoot.remove(object);
+      disposeObjectTree(object);
+    }
+    this.photoObjects.clear();
+    for (const photo of this.mappingRoom.referencePhotos || []) {
+      if (photo.visible === false || !photo.dataUrl) continue;
+      const cached = this.photoTextures.get(photo.id);
+      if (!cached && !this.photoTextures.get(`${photo.id}:loading`)) {
+        this.photoTextures.set(`${photo.id}:loading`, true);
+        textureFromRawImageDataUrl(photo.dataUrl).then((texture) => {
+          this.photoTextures.delete(`${photo.id}:loading`);
+          this.photoTextures.set(photo.id, texture);
+          if (this.running) this.syncReferencePhotos();
+        }).catch(() => this.photoTextures.delete(`${photo.id}:loading`));
+      }
+      const material = new THREE.MeshBasicMaterial({
+        map: cached || null,
+        color: cached ? 0xffffff : 0x2a3447,
+        side: THREE.DoubleSide,
+        transparent: true,
+        opacity: Number(photo.opacity ?? 0.42)
+      });
+      const mesh = new THREE.Mesh(new THREE.PlaneGeometry(photo.width || 260, photo.height || 146), material);
+      mesh.position.set(photo.x || 0, photo.y || 135, photo.z || -205);
+      mesh.rotation.set(photo.rotX || 0, photo.rotY || 0, photo.rotZ || 0, 'YXZ');
+      this.photoRoot.add(mesh);
+      this.photoObjects.set(photo.id, mesh);
+    }
+  }
+
+  syncProjectors() {
+    const visible = this.mappingRoom.showProjectors !== false;
+    const ids = new Set(this.projectors.map((projector) => projector.id));
+    for (const [id, object] of this.projectorObjects) {
+      if (!ids.has(id)) {
+        this.projectorRoot.remove(object.camera, object.gizmo, object.body);
+        object.gizmo.geometry.dispose();
+        object.gizmo.material.dispose();
+        object.body.material.dispose();
+        this.projectorObjects.delete(id);
+      }
+    }
+    for (const projector of this.projectors) {
+      let object = this.projectorObjects.get(projector.id);
+      if (!object) {
+        const camera = new THREE.PerspectiveCamera(projector.fov, projector.orientation === 'portrait' ? 9 / 16 : 16 / 9, 0.1, 6000);
+        camera.rotation.order = 'YXZ';
+        const gizmo = makeProjectionGizmo(projector.color);
+        const body = new THREE.Mesh(this.bodyGeo, new THREE.MeshBasicMaterial({ color: projector.color, transparent: true, opacity: 0.88 }));
+        body.layers.set(LAYER_GIZMO);
+        gizmo.layers.set(LAYER_GIZMO);
+        this.projectorRoot.add(camera, gizmo, body);
+        object = { camera, gizmo, body };
+        this.projectorObjects.set(projector.id, object);
+      }
+      object.camera.position.set(projector.offX || 0, projector.offY || 0, projector.offZ || 0);
+      object.camera.rotation.y = projector.yaw || 0;
+      object.camera.rotation.x = projector.pitch || 0;
+      object.camera.rotation.z = projector.orientation === 'portrait' ? Math.PI / 2 : 0;
+      object.camera.fov = projector.fov || 75;
+      object.camera.aspect = projector.orientation === 'portrait' ? 9 / 16 : 16 / 9;
+      object.camera.updateProjectionMatrix();
+      object.body.position.copy(object.camera.position);
+      object.body.quaternion.copy(object.camera.quaternion);
+      object.body.material.color.set(projector.color);
+      object.gizmo.material.color.set(projector.color);
+      object.gizmo.material.opacity = visible ? 0.72 : 0;
+      object.body.visible = visible;
+      object.gizmo.visible = visible;
+      updateProjectionGizmo(object.gizmo, object.camera, object.camera.fov, object.camera.aspect);
+    }
+  }
+
+  attachTransform() {
+    const selected = this.roomObjects.get(this.mappingRoom.selectedObjectId);
+    if (selected) this.transform.attach(selected);
+    else this.transform.detach();
+    this.transformHelper.traverse((child) => child.layers.set(LAYER_GIZMO));
+  }
+
+  async setImageDataUrl(imageDataUrl, palette, seed = 1) {
+    try {
+      const canvas = await panoramaCanvasFromImageDataUrl(imageDataUrl, palette, seed);
+      const nextTexture = textureFromCanvas(canvas);
+      const previous = this.worldTexture;
+      this.worldTexture = nextTexture;
+      this.syncRoomObjects();
+      this.attachTransform();
+      previous?.dispose();
+    } catch (error) {
+      console.error('[takemethere] mapping room texture failed', error);
+      const previous = this.worldTexture;
+      this.worldTexture = createFallbackPanoramaTexture(palette, seed);
+      this.syncRoomObjects();
+      this.attachTransform();
+      previous?.dispose();
+    }
+  }
+
+  resize() {
+    const rect = this.host.getBoundingClientRect();
+    const width = Math.max(1, Math.floor(rect.width));
+    const height = Math.max(1, Math.floor(rect.height));
+    this.renderer.setSize(width, height, false);
+    this.camera.aspect = width / height;
+    this.camera.updateProjectionMatrix();
+  }
+
+  animate() {
+    if (!this.running) return;
+    this.orbit.update();
+    this.renderer.render(this.scene, this.camera);
+    this.raf = requestAnimationFrame(this.animate);
+  }
+
+  dispose() {
+    this.running = false;
+    if (this.raf) cancelAnimationFrame(this.raf);
+    this.resizeObserver.disconnect();
+    for (const dispose of this.controlsDisposers) dispose();
+    this.transform.dispose();
+    this.orbit.dispose();
+    for (const object of this.roomObjects.values()) disposeObjectTree(object);
+    for (const object of this.photoObjects.values()) disposeObjectTree(object);
+    for (const object of this.projectorObjects.values()) {
+      object.gizmo.geometry.dispose();
+      object.gizmo.material.dispose();
+      object.body.material.dispose();
+    }
+    for (const texture of this.photoTextures.values()) {
+      if (texture && typeof texture.dispose === 'function') texture.dispose();
+    }
+    this.worldTexture?.dispose();
+    this.testTexture?.dispose();
+    this.bodyGeo.dispose();
+    this.grid.geometry.dispose();
+    this.grid.material.dispose();
+    this.axes.geometry.dispose();
+    this.renderer.renderLists.dispose();
+    this.renderer.dispose();
   }
 }
 

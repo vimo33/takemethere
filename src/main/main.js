@@ -15,10 +15,14 @@ let outputWindow;
 let ndiSourceWindows = [];
 let ndiAutoStart = true;
 let ndiFeedSignature = '';
+let outputRevision = 0;
 let transitionToken = 0;
 let transitionTimers = [];
 
 const DEBUG_LOG = path.join(__dirname, '../../electron-debug.log');
+const APP_ROOT = path.join(__dirname, '../..');
+const GENERATED_WORLDS_DIR = path.join(APP_ROOT, 'generated-worlds');
+const SESSION_HISTORY_FILE = path.join(APP_ROOT, 'session-history.json');
 const DEFAULT_PROJECTORS = [
   { id: 'L', label: 'LEFT', yaw: Math.PI / 2.6, pitch: 0, fov: 78, offX: 0, offY: 0, offZ: 0, color: 0x5cd3ff, live: true, signal: 'DP-1 / 1920x1080', orientation: 'landscape' },
   { id: 'F', label: 'FRONT', yaw: 0, pitch: 0, fov: 78, offX: 0, offY: 0, offZ: 0, color: 0xa87fff, live: true, signal: 'HDMI-2 / 3840x2160', orientation: 'landscape' },
@@ -121,6 +125,158 @@ function normalizeSceneBuilder(builder = {}) {
   };
 }
 
+function defaultMappingSurfaces() {
+  return [
+    mappingItem('floor', 'Floor Plane', 'surface', 'plane', 0, 0, 0, -Math.PI / 2, 0, 0, 540, 420, 8, 'test', 0.72, true),
+    mappingItem('wall-left', 'Left Wall', 'surface', 'plane', -270, 135, 0, 0, Math.PI / 2, 0, 420, 270, 8, 'world', 0.82, true),
+    mappingItem('wall-front', 'Front Wall', 'surface', 'plane', 0, 135, -210, 0, 0, 0, 540, 270, 8, 'world', 0.9, true),
+    mappingItem('wall-right', 'Right Wall', 'surface', 'plane', 270, 135, 0, 0, -Math.PI / 2, 0, 420, 270, 8, 'world', 0.82, true),
+    mappingItem('ceiling', 'Ceiling', 'surface', 'plane', 0, 270, 0, Math.PI / 2, 0, 0, 540, 420, 8, 'transparent', 0.28, false)
+  ];
+}
+
+function mappingItem(id, label, role, shape, x, y, z, rotX, rotY, rotZ, width, height, depth, materialMode, opacity, visible) {
+  return {
+    id,
+    label,
+    role,
+    shape,
+    x,
+    y,
+    z,
+    rotX,
+    rotY,
+    rotZ,
+    width,
+    height,
+    depth,
+    radius: 45,
+    materialMode,
+    opacity,
+    feather: 0,
+    visible,
+    color: role === 'mask' ? 0xff5a4d : role === 'surface' ? 0x5cd3ff : 0xa87fff,
+    locked: false
+  };
+}
+
+function createMappingObject(shape = 'box', index = 1) {
+  const id = nextMappingRoomObjectId(shape);
+  const defaults = {
+    plane: mappingItem(id, `Projection Plane ${index}`, 'object', 'plane', 0, 120, -120, 0, 0, 0, 160, 110, 8, 'world', 0.78, true),
+    box: mappingItem(id, `Projection Box ${index}`, 'object', 'box', 0, 55, -90, 0, 0, 0, 80, 100, 80, 'world', 0.82, true),
+    cylinder: mappingItem(id, `Projection Cylinder ${index}`, 'object', 'cylinder', 120, 60, -80, 0, 0, 0, 90, 120, 90, 'world', 0.78, true),
+    frame: mappingItem(id, `Door Frame ${index}`, 'mask', 'frame', 0, 115, -208, 0, 0, 0, 110, 210, 12, 'mask', 0.55, true),
+    mask: mappingItem(id, `Mask Plane ${index}`, 'mask', 'plane', 0, 105, -206, 0, 0, 0, 130, 130, 8, 'mask', 0.68, true)
+  };
+  return defaults[shape] || defaults.box;
+}
+
+function normalizeMappingRoomItem(item = {}, index = 0) {
+  const fallback = defaultMappingSurfaces()[index] || createMappingObject(item.shape || 'box', index + 1);
+  const shape = ['plane', 'box', 'cylinder', 'frame'].includes(item.shape) ? item.shape : fallback.shape;
+  const role = ['surface', 'object', 'mask'].includes(item.role) ? item.role : fallback.role;
+  const materialMode = ['world', 'test', 'mask', 'transparent', 'solid'].includes(item.materialMode) ? item.materialMode : fallback.materialMode;
+  return {
+    id: String(item.id || fallback.id || `mapping-${index + 1}`),
+    label: String(item.label || fallback.label || `Mapping ${index + 1}`),
+    role,
+    shape,
+    x: number(item.x, fallback.x || 0),
+    y: number(item.y, fallback.y || 0),
+    z: number(item.z, fallback.z || 0),
+    rotX: number(item.rotX, fallback.rotX || 0),
+    rotY: number(item.rotY, fallback.rotY || 0),
+    rotZ: number(item.rotZ, fallback.rotZ || 0),
+    width: clamp(number(item.width, fallback.width || 100), 2, 2000),
+    height: clamp(number(item.height, fallback.height || 100), 2, 2000),
+    depth: clamp(number(item.depth, fallback.depth || 8), 1, 2000),
+    radius: clamp(number(item.radius, fallback.radius || 45), 1, 1000),
+    materialMode,
+    opacity: clamp(number(item.opacity, fallback.opacity ?? 0.8), 0, 1),
+    feather: clamp(number(item.feather, fallback.feather || 0), 0, 1),
+    visible: item.visible !== false,
+    color: Number(item.color ?? fallback.color ?? 0xa87fff),
+    locked: !!item.locked
+  };
+}
+
+function normalizeReferencePhoto(photo = {}, index = 0) {
+  const id = String(photo.id || `photo-${index + 1}`);
+  return {
+    id,
+    label: String(photo.label || `Reference Photo ${index + 1}`),
+    dataUrl: String(photo.dataUrl || ''),
+    x: number(photo.x, 0),
+    y: number(photo.y, 135),
+    z: number(photo.z, -205),
+    rotX: number(photo.rotX, 0),
+    rotY: number(photo.rotY, 0),
+    rotZ: number(photo.rotZ, 0),
+    width: clamp(number(photo.width, 260), 10, 2000),
+    height: clamp(number(photo.height, 146), 10, 2000),
+    opacity: clamp(number(photo.opacity, 0.42), 0, 1),
+    visible: photo.visible !== false
+  };
+}
+
+function normalizeMappingRoom(mappingRoom = {}) {
+  const surfaces = Array.isArray(mappingRoom.surfaces) && mappingRoom.surfaces.length
+    ? mappingRoom.surfaces.map(normalizeMappingRoomItem)
+    : defaultMappingSurfaces();
+  const objects = Array.isArray(mappingRoom.objects) ? mappingRoom.objects.map((item, index) => normalizeMappingRoomItem(item, index + surfaces.length)) : [];
+  const masks = Array.isArray(mappingRoom.masks) ? mappingRoom.masks.map((item, index) => normalizeMappingRoomItem({ ...item, role: 'mask' }, index + surfaces.length + objects.length)) : [];
+  const selectedObjectId = [...surfaces, ...objects, ...masks].some((item) => item.id === mappingRoom.selectedObjectId)
+    ? mappingRoom.selectedObjectId
+    : 'wall-front';
+  return {
+    enabled: mappingRoom.enabled !== false,
+    showProjectors: mappingRoom.showProjectors !== false,
+    captureMode: mappingRoom.captureMode || 'manual-photo',
+    selectedObjectId,
+    mainView: {
+      pos: Array.isArray(mappingRoom.mainView?.pos) ? mappingRoom.mainView.pos.slice(0, 3).map(Number) : [0, 260, 620],
+      target: Array.isArray(mappingRoom.mainView?.target) ? mappingRoom.mainView.target.slice(0, 3).map(Number) : [0, 110, -80],
+      fov: number(mappingRoom.mainView?.fov, 55)
+    },
+    surfaces,
+    objects,
+    masks,
+    referencePhotos: Array.isArray(mappingRoom.referencePhotos) ? mappingRoom.referencePhotos.map(normalizeReferencePhoto) : []
+  };
+}
+
+function nextMappingRoomObjectId(shape = 'object') {
+  const safe = String(shape || 'object').toLowerCase().replace(/[^a-z0-9]+/g, '-') || 'object';
+  const ids = new Set([...(session?.mappingRoom?.surfaces || []), ...(session?.mappingRoom?.objects || []), ...(session?.mappingRoom?.masks || [])].map((item) => item.id));
+  let index = ids.size + 1;
+  while (ids.has(`${safe}-${index}`)) index += 1;
+  return `${safe}-${index}`;
+}
+
+function updateMappingRoomItem(id, patch) {
+  if (!id || !patch || typeof patch !== 'object') return false;
+  let found = false;
+  for (const key of ['surfaces', 'objects', 'masks']) {
+    session.mappingRoom[key] = session.mappingRoom[key].map((item, index) => {
+      if (item.id !== id) return item;
+      found = true;
+      return normalizeMappingRoomItem({ ...item, ...patch }, index);
+    });
+  }
+  if (patch.selected === true && found) session.mappingRoom.selectedObjectId = id;
+  session.mappingRoom = normalizeMappingRoom(session.mappingRoom);
+  return found;
+}
+
+function number(value, fallback) {
+  return Number.isFinite(Number(value)) ? Number(value) : fallback;
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
 function syncOutputMappingsFromCameras() {
   const mappings = { ...(session.outputMappings || defaultOutputMappings()) };
   for (const camera of session.sceneBuilder.cameras) {
@@ -219,6 +375,7 @@ const session = {
     depthMode: 'single',
     mainView: { yaw: 0, pitch: 0, fov: 75, pos: [0, 0, 0], overview: false }
   }),
+  mappingRoom: normalizeMappingRoom(),
   outputMappings: defaultOutputMappings(),
   blackout: false,
   costEstimateUsd: 0,
@@ -235,9 +392,7 @@ const session = {
 syncProjectorsFromSceneBuilder();
 
 try {
-  const file = path.join(__dirname, '../../session-history.json');
-  const history = JSON.parse(fs.readFileSync(file, 'utf8'));
-  if (Array.isArray(history)) session.history = history.slice(-12).reverse();
+  session.history = listSessionHistory(48);
 } catch {
   session.history = [];
 }
@@ -431,6 +586,33 @@ async function runSmokeCheck() {
         document.querySelector('[data-surface="live"]')?.click();
         await wait(600);
         result.returnedLive = document.body.textContent.includes('Generation Pipeline');
+        document.querySelector('.topbar-right [data-surface="mapping-room"]')?.click();
+        await wait(900);
+        result.mappingVisible = document.body.textContent.includes('MAPPING ROOM') && !!document.querySelector('[data-mapping-room]');
+        result.mappingControls = {
+          addPlane: !!document.querySelector('[data-action="add-mapping-item"][data-shape="plane"]'),
+          addFrame: !!document.querySelector('[data-action="add-mapping-item"][data-shape="frame"]'),
+          selectedSlider: !!document.querySelector('[data-slider-kind="mapping"][data-key="x"]')
+        };
+        const mappingRowsBefore = document.querySelectorAll('.mapping-row[data-action="select-mapping"]').length;
+        document.querySelector('[data-action="add-mapping-item"][data-shape="box"]')?.click();
+        await wait(500);
+        result.mappingRowsAfterBox = document.querySelectorAll('.mapping-row[data-action="select-mapping"]').length;
+        document.querySelector('[data-action="add-mapping-item"][data-shape="frame"]')?.click();
+        await wait(500);
+        result.mappingRowsAfterFrame = document.querySelectorAll('.mapping-row[data-action="select-mapping"]').length;
+        result.mappingAdded = result.mappingRowsAfterBox > mappingRowsBefore && result.mappingRowsAfterFrame > result.mappingRowsAfterBox && document.body.textContent.includes('Door Frame');
+        const mappingSlider = document.querySelector('[data-slider-kind="mapping"][data-key="x"]');
+        if (mappingSlider) {
+          mappingSlider.value = '42';
+          mappingSlider.dispatchEvent(new Event('input', { bubbles: true }));
+          await wait(500);
+          const nextMappingSlider = document.querySelector('[data-slider-kind="mapping"][data-key="x"]');
+          result.mappingSliderUpdated = !!nextMappingSlider && Math.abs(Number(nextMappingSlider.value) - 42) < 0.01;
+        }
+        document.querySelector('[data-surface="live"]')?.click();
+        await wait(600);
+        result.returnedLiveAfterMapping = document.body.textContent.includes('Generation Pipeline');
         result.providerWarning = document.body.textContent.includes('Cloud image generation is not configured');
         document.querySelector('[data-action="generate"]')?.click();
         await wait(1200);
@@ -447,7 +629,7 @@ async function runSmokeCheck() {
       })();
     `);
     debugLog(`smoke ${JSON.stringify(report)}`);
-    const failed = !report.loaded || !report.liveVisible || !report.sceneVisible || !report.returnedLive || !report.generateProgression || !report.loadedPreviousWorld || !report.fallbackState || !report.surfaceScrollAfter?.canReachBottom || !report.sceneControls?.yawSlider || !report.sceneControls?.addCamera || report.cameraCountAfterAdd < 5 || !report.yawSliderUpdated || !report.yawSliderDomStable;
+    const failed = !report.loaded || !report.liveVisible || !report.sceneVisible || !report.returnedLive || !report.returnedLiveAfterMapping || !report.generateProgression || !report.loadedPreviousWorld || !report.fallbackState || !report.surfaceScrollAfter?.canReachBottom || !report.sceneControls?.yawSlider || !report.sceneControls?.addCamera || report.cameraCountAfterAdd < 5 || !report.yawSliderUpdated || !report.yawSliderDomStable || !report.mappingVisible || !report.mappingControls?.addPlane || !report.mappingControls?.addFrame || !report.mappingControls?.selectedSlider || !report.mappingAdded || !report.mappingSliderUpdated;
     setTimeout(() => {
       app.exit(failed ? 1 : 0);
     }, 250);
@@ -469,6 +651,8 @@ function broadcastSession() {
 }
 
 function serializeSession() {
+  const generatedWorlds = listGeneratedWorlds();
+  session.history = listSessionHistory(48, generatedWorlds);
   return {
     ...session,
     state: session.state,
@@ -478,11 +662,24 @@ function serializeSession() {
       cameras: session.sceneBuilder.cameras.map((camera) => ({ ...camera })),
       mainView: { ...session.sceneBuilder.mainView, pos: session.sceneBuilder.mainView.pos.slice() }
     },
+    mappingRoom: {
+      ...session.mappingRoom,
+      mainView: {
+        ...session.mappingRoom.mainView,
+        pos: session.mappingRoom.mainView.pos.slice(),
+        target: session.mappingRoom.mainView.target.slice()
+      },
+      surfaces: session.mappingRoom.surfaces.map((item) => ({ ...item })),
+      objects: session.mappingRoom.objects.map((item) => ({ ...item })),
+      masks: session.mappingRoom.masks.map((item) => ({ ...item })),
+      referencePhotos: session.mappingRoom.referencePhotos.map((photo) => ({ ...photo }))
+    },
     outputMappings: { ...session.outputMappings },
+    outputRevision,
     sceneSettings: { ...session.sceneSettings },
     ndi: ndiManager.getStatus(),
-    history: session.history.slice(0, 12),
-    generatedWorlds: listGeneratedWorlds().slice(0, 24),
+    history: session.history.slice(0, 48),
+    generatedWorlds: generatedWorlds.slice(0, 48),
     config: {
       hasGemini: !!process.env.GEMINI_API_KEY,
       hasOpenAI: !!process.env.OPENAI_API_KEY,
@@ -495,6 +692,7 @@ function serializeSession() {
 
 function setState(key, extras = {}) {
   session.state = getState(key);
+  if (['PORTAL_OPENING', 'ARRIVAL', 'WORLD_ACTIVE', 'ERROR_FALLBACK', 'BLACKOUT', 'RESET'].includes(key)) outputRevision += 1;
   Object.assign(session, extras);
   broadcastSession();
 }
@@ -514,8 +712,7 @@ function scheduleState(key, delayMs, token = transitionToken) {
 
 function saveGeneratedImage(imageDataUrl, recipe) {
   try {
-    const dir = path.join(__dirname, '../../generated-worlds');
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    if (!fs.existsSync(GENERATED_WORLDS_DIR)) fs.mkdirSync(GENERATED_WORLDS_DIR, { recursive: true });
     const match = String(imageDataUrl || '').match(/^data:(image\/[a-z0-9.+-]+);base64,(.+)$/i);
     if (!match) throw new Error('Unsupported image data URL');
     const mime = match[1].toLowerCase();
@@ -524,7 +721,7 @@ function saveGeneratedImage(imageDataUrl, recipe) {
     const slug = (recipe?.title || 'world').toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40);
     const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
     const filename = `${ts}-${slug}.${ext}`;
-    fs.writeFileSync(path.join(dir, filename), Buffer.from(base64, 'base64'));
+    fs.writeFileSync(path.join(GENERATED_WORLDS_DIR, filename), Buffer.from(base64, 'base64'));
     debugLog(`image saved: ${filename}`);
     return filename;
   } catch (error) {
@@ -554,20 +751,85 @@ function mimeFromGeneratedWorld(name) {
   return 'image/png';
 }
 
-function listGeneratedWorlds() {
-  const dir = path.join(__dirname, '../../generated-worlds');
+function worldTitleFromFilename(name) {
+  const slug = String(name || '').replace(/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-/, '').replace(/\.[^.]+$/, '');
+  return slug.split('-').filter(Boolean).map((word) => word.charAt(0).toUpperCase() + word.slice(1)).join(' ') || name;
+}
+
+function slugifyHistoryMatch(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+}
+
+function generatedWorldTimestamp(name) {
+  const match = String(name || '').match(/^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-/);
+  if (!match) return NaN;
+  return Date.parse(`${match[1]}T${match[2]}:${match[3]}:${match[4]}Z`);
+}
+
+function generatedWorldRecord(name) {
   try {
-    if (!fs.existsSync(dir)) return [];
-    return fs.readdirSync(dir)
-      .filter((name) => /\.(png|jpe?g|webp|svg)$/i.test(name))
-      .map((name) => {
-        const full = path.join(dir, name);
-        const stat = fs.statSync(full);
-        const slug = name.replace(/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-/, '').replace(/\.[^.]+$/, '');
-        const title = slug.split('-').filter(Boolean).map((word) => word.charAt(0).toUpperCase() + word.slice(1)).join(' ') || name;
-        return { name, title, path: full, size: stat.size, mtimeMs: stat.mtimeMs, at: stat.mtime.toISOString(), readable: isReadableGeneratedWorld(name, full) };
-      })
-      .filter((world) => world.readable)
+    const full = path.join(GENERATED_WORLDS_DIR, name);
+    const stat = fs.statSync(full);
+    if (stat.isDirectory()) {
+      const imageName = ['image.png', 'image.jpg', 'image.jpeg', 'image.webp', 'image.svg']
+        .find((candidate) => fs.existsSync(path.join(full, candidate)))
+        || fs.readdirSync(full).find((candidate) => /\.(png|jpe?g|webp|svg)$/i.test(candidate) && !/^depth\./i.test(candidate));
+      if (!imageName) return null;
+      const imagePath = path.join(full, imageName);
+      const imageStat = fs.statSync(imagePath);
+      if (!isReadableGeneratedWorld(imageName, imagePath)) return null;
+      let metadata = {};
+      try {
+        metadata = JSON.parse(fs.readFileSync(path.join(full, 'metadata.json'), 'utf8'));
+      } catch {
+        metadata = {};
+      }
+      return {
+        name,
+        title: metadata.title || worldTitleFromFilename(name),
+        path: imagePath,
+        imageName,
+        folder: full,
+        depthPath: fs.existsSync(path.join(full, 'depth.png')) ? path.join(full, 'depth.png') : '',
+        metadataPath: fs.existsSync(path.join(full, 'metadata.json')) ? path.join(full, 'metadata.json') : '',
+        size: imageStat.size,
+        mtimeMs: imageStat.mtimeMs,
+        at: metadata.createdAt || imageStat.mtime.toISOString(),
+        fileTimeMs: generatedWorldTimestamp(name),
+        provider: metadata.provider || {},
+        timings: metadata.timings || {},
+        readable: true
+      };
+    }
+    if (!/\.(png|jpe?g|webp|svg)$/i.test(name)) return null;
+    if (!isReadableGeneratedWorld(name, full)) return null;
+    return {
+      name,
+      title: worldTitleFromFilename(name),
+      path: full,
+      imageName: name,
+      folder: '',
+      depthPath: '',
+      metadataPath: '',
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      at: stat.mtime.toISOString(),
+      fileTimeMs: generatedWorldTimestamp(name),
+      provider: {},
+      timings: {},
+      readable: true
+    };
+  } catch {
+    return null;
+  }
+}
+
+function listGeneratedWorlds() {
+  try {
+    if (!fs.existsSync(GENERATED_WORLDS_DIR)) return [];
+    return fs.readdirSync(GENERATED_WORLDS_DIR)
+      .map(generatedWorldRecord)
+      .filter(Boolean)
       .sort((a, b) => b.mtimeMs - a.mtimeMs);
   } catch (error) {
     debugLog('listGeneratedWorlds failed', error);
@@ -575,30 +837,127 @@ function listGeneratedWorlds() {
   }
 }
 
-function loadGeneratedWorld(filename) {
-  const worlds = listGeneratedWorlds();
-  const world = worlds.find((item) => item.name === filename);
-  if (!world) throw new Error(`Generated world not found: ${filename}`);
-  const mime = mimeFromGeneratedWorld(world.name);
-  const imageDataUrl = `data:${mime};base64,${fs.readFileSync(world.path).toString('base64')}`;
-  session.imageDataUrl = imageDataUrl;
-  session.recipe = {
-    ...createFallbackRecipe(world.title),
-    title: world.title,
-    visitor_input: world.title,
-    visual_prompt: `Previously generated Take Me There world loaded from ${world.name}.`
+function readSessionHistory() {
+  try {
+    const history = JSON.parse(fs.readFileSync(SESSION_HISTORY_FILE, 'utf8'));
+    return Array.isArray(history) ? history : [];
+  } catch {
+    return [];
+  }
+}
+
+function findWorldForHistoryEntry(entry, worlds = listGeneratedWorlds()) {
+  if (!entry || !Array.isArray(worlds) || worlds.length === 0) return null;
+  const imageFile = String(entry.imageFile || '').replace(/\\/g, '/');
+  if (imageFile) {
+    const exact = worlds.find((world) => (
+      world.name === imageFile
+      || imageFile.endsWith(`/${world.name}`)
+      || imageFile.endsWith(`/${world.name}/${world.imageName}`)
+    ));
+    if (exact) return exact;
+  }
+
+  const titleSlug = slugifyHistoryMatch(entry.title || entry.transcript);
+  const titleMatches = titleSlug
+    ? worlds.filter((world) => world.name.toLowerCase().includes(titleSlug))
+    : [];
+  const entryTime = Date.parse(entry.at || '');
+  if (titleMatches.length && Number.isFinite(entryTime)) {
+    const bestTitleMatch = titleMatches
+      .map((world) => ({ world, delta: Math.abs((Number.isFinite(world.fileTimeMs) ? world.fileTimeMs : world.mtimeMs) - entryTime) }))
+      .sort((a, b) => a.delta - b.delta)[0];
+    if (bestTitleMatch && bestTitleMatch.delta <= 90 * 1000) return bestTitleMatch.world;
+  }
+  if (titleMatches.length === 1 && !Number.isFinite(entryTime)) return titleMatches[0];
+
+  if (!Number.isFinite(entryTime)) return null;
+  return worlds
+    .map((world) => ({ world, delta: Math.abs((Number.isFinite(world.fileTimeMs) ? world.fileTimeMs : world.mtimeMs) - entryTime) }))
+    .filter((item) => item.delta <= 90 * 1000)
+    .sort((a, b) => a.delta - b.delta)[0]?.world || null;
+}
+
+function decorateSessionHistoryEntry(entry, historyIndex, worlds = listGeneratedWorlds()) {
+  const world = findWorldForHistoryEntry(entry, worlds);
+  return {
+    historyIndex,
+    at: entry?.at || '',
+    event: entry?.event || '',
+    state: entry?.state || '',
+    title: entry?.title || entry?.transcript || world?.title || 'World',
+    transcript: entry?.transcript || '',
+    provider: entry?.provider || {},
+    timings: entry?.timings || {},
+    imageMs: entry?.imageMs || 0,
+    costEstimateUsd: Number(entry?.costEstimateUsd || entry?.cost || 0),
+    layoutMode: entry?.layoutMode || '',
+    error: entry?.error || '',
+    imageFile: entry?.imageFile || '',
+    worldName: world?.name || '',
+    worldAt: world?.at || '',
+    loadable: !!world,
+    missingImage: !world
   };
-  session.transcript = world.title;
-  session.provider.prompt = 'loaded-previous';
+}
+
+function listSessionHistory(limit = 48, worlds = listGeneratedWorlds()) {
+  const history = readSessionHistory();
+  return history
+    .map((entry, index) => decorateSessionHistoryEntry(entry, index, worlds))
+    .slice(-limit)
+    .reverse();
+}
+
+function loadGeneratedWorldRecord(world, source = null) {
+  const mime = mimeFromGeneratedWorld(world.imageName || world.name);
+  const imageDataUrl = `data:${mime};base64,${fs.readFileSync(world.path).toString('base64')}`;
+  const title = source?.title || world.title;
+  const transcript = source?.transcript || title;
+  session.imageDataUrl = imageDataUrl;
+  outputRevision += 1;
+  session.imageFile = world.name;
+  session.recipe = {
+    ...createFallbackRecipe(transcript || title),
+    title,
+    visitor_input: transcript,
+    visual_prompt: source
+      ? `Session history world loaded from ${world.name}. Original visitor prompt: ${transcript || title}.`
+      : `Previously generated Take Me There world loaded from ${world.name}.`
+  };
+  session.transcript = transcript;
+  session.provider.prompt = source ? 'loaded-session-history' : 'loaded-previous';
   session.provider.image = world.name;
   session.error = '';
-  session.timings = { promptMs: 0, imageMs: 0 };
-  session.costEstimateUsd = 0;
+  session.timings = source?.timings || { promptMs: 0, imageMs: 0 };
+  session.costEstimateUsd = source ? Number(source.costEstimateUsd || 0) : 0;
   session.sceneSettings.outputTestMode = false;
   if (session.sceneSettings.worldMode === 'test') session.sceneSettings.worldMode = 'single';
   clearTransitions();
   setState('WORLD_ACTIVE');
   return serializeSession();
+}
+
+function loadGeneratedWorld(filename) {
+  const worlds = listGeneratedWorlds();
+  const world = worlds.find((item) => item.name === filename);
+  if (!world) throw new Error(`Generated world not found: ${filename}`);
+  return loadGeneratedWorldRecord(world);
+}
+
+function loadSessionHistoryEntry(historyIndex) {
+  const index = Number(historyIndex);
+  const history = readSessionHistory();
+  if (!Number.isInteger(index) || index < 0 || index >= history.length) {
+    throw new Error(`Session history entry not found: ${historyIndex}`);
+  }
+  const worlds = listGeneratedWorlds();
+  const entry = history[index];
+  const world = findWorldForHistoryEntry(entry, worlds);
+  if (!world) {
+    throw new Error(`No saved image is available for "${entry?.title || entry?.transcript || 'this history entry'}".`);
+  }
+  return loadGeneratedWorldRecord(world, decorateSessionHistoryEntry(entry, index, worlds));
 }
 
 function writeSessionHistory(eventName) {
@@ -616,18 +975,17 @@ function writeSessionHistory(eventName) {
     imageFile: session.imageFile || ''
   };
 
-  const file = path.join(__dirname, '../../session-history.json');
   let history = [];
   try {
-    history = JSON.parse(fs.readFileSync(file, 'utf8'));
+    history = JSON.parse(fs.readFileSync(SESSION_HISTORY_FILE, 'utf8'));
     if (!Array.isArray(history)) history = [];
   } catch {
     history = [];
   }
   history.push(record);
   const nextHistory = history.slice(-200);
-  fs.writeFileSync(file, `${JSON.stringify(nextHistory, null, 2)}\n`);
-  session.history = nextHistory.slice(-12).reverse();
+  fs.writeFileSync(SESSION_HISTORY_FILE, `${JSON.stringify(nextHistory, null, 2)}\n`);
+  session.history = listSessionHistory(48);
 }
 
 async function generateWorld(visitorInput) {
@@ -637,6 +995,7 @@ async function generateWorld(visitorInput) {
   session.transcript = prompt;
   session.error = '';
   session.timings = {};
+  session.imageFile = '';
   session.costEstimateUsd = 0;
   session.sceneSettings.fog = session.recipe?.fog || session.sceneSettings.fog;
   session.sceneSettings.outputTestMode = false;
@@ -663,6 +1022,7 @@ async function generateWorld(visitorInput) {
   try {
     const image = await generateImage(session.recipe);
     session.imageDataUrl = image.imageDataUrl;
+    outputRevision += 1;
     session.provider.image = image.provider;
     session.timings.imageMs = image.latencyMs;
     session.costEstimateUsd += image.estimatedCostUsd || 0;
@@ -675,6 +1035,7 @@ async function generateWorld(visitorInput) {
   } catch (error) {
     session.error = error.message;
     session.imageDataUrl = createSvgDataUrl(session.recipe);
+    outputRevision += 1;
     session.provider.image = 'local-svg-fallback-after-error';
     session.imageFile = saveGeneratedImage(session.imageDataUrl, session.recipe);
     writeSessionHistory('world_generated_with_fallback');
@@ -690,6 +1051,8 @@ ipcMain.handle('session:get', () => serializeSession());
 ipcMain.handle('session:list-generated-worlds', () => listGeneratedWorlds());
 
 ipcMain.handle('session:load-generated-world', (_event, filename) => loadGeneratedWorld(filename));
+
+ipcMain.handle('session:load-history-entry', (_event, historyIndex) => loadSessionHistoryEntry(historyIndex));
 
 ipcMain.handle('session:set-state', (_event, key) => {
   if (key === 'RESET') {
@@ -717,8 +1080,12 @@ ipcMain.handle('session:fallback-world', (_event, visitorInput) => {
   const token = transitionToken;
   const prompt = visitorInput || session.transcript || 'somewhere calm, blue, and endless';
   session.transcript = prompt;
+  session.error = '';
+  session.timings = { promptMs: 0, imageMs: 0 };
   session.recipe = createFallbackRecipe(prompt);
   session.imageDataUrl = createSvgDataUrl(session.recipe);
+  outputRevision += 1;
+  session.imageFile = saveGeneratedImage(session.imageDataUrl, session.recipe);
   session.provider.prompt = 'local-fallback';
   session.provider.image = 'local-svg-fallback';
   session.costEstimateUsd = 0;
@@ -863,6 +1230,74 @@ ipcMain.handle('session:update-scene-builder', (_event, patch) => {
   return serializeSession();
 });
 
+ipcMain.handle('session:update-mapping-room', (_event, patch) => {
+  if (!patch || typeof patch !== 'object') return serializeSession();
+  session.mappingRoom = normalizeMappingRoom({
+    ...session.mappingRoom,
+    ...patch,
+    mainView: { ...session.mappingRoom.mainView, ...(patch.mainView || {}) }
+  });
+  broadcastSession();
+  return serializeSession();
+});
+
+ipcMain.handle('session:add-mapping-room-item', (_event, shape) => {
+  const item = createMappingObject(shape, session.mappingRoom.objects.length + session.mappingRoom.masks.length + 1);
+  if (item.role === 'mask') session.mappingRoom.masks.push(item);
+  else session.mappingRoom.objects.push(item);
+  session.mappingRoom.selectedObjectId = item.id;
+  session.mappingRoom = normalizeMappingRoom(session.mappingRoom);
+  broadcastSession();
+  return serializeSession();
+});
+
+ipcMain.handle('session:update-mapping-room-item', (_event, id, patch) => {
+  if (updateMappingRoomItem(id, patch)) broadcastSession();
+  return serializeSession();
+});
+
+ipcMain.handle('session:remove-mapping-room-item', (_event, id) => {
+  if (!id) return serializeSession();
+  const isSurface = session.mappingRoom.surfaces.some((item) => item.id === id);
+  if (isSurface) {
+    updateMappingRoomItem(id, { visible: false });
+  } else {
+    session.mappingRoom.objects = session.mappingRoom.objects.filter((item) => item.id !== id);
+    session.mappingRoom.masks = session.mappingRoom.masks.filter((item) => item.id !== id);
+    if (session.mappingRoom.selectedObjectId === id) session.mappingRoom.selectedObjectId = session.mappingRoom.surfaces[0]?.id || '';
+    session.mappingRoom = normalizeMappingRoom(session.mappingRoom);
+  }
+  broadcastSession();
+  return serializeSession();
+});
+
+ipcMain.handle('session:add-mapping-room-reference-photo', (_event, photo) => {
+  if (!photo || typeof photo !== 'object') return serializeSession();
+  const id = `photo-${Date.now().toString(36)}`;
+  session.mappingRoom.referencePhotos.push(normalizeReferencePhoto({ ...photo, id }, session.mappingRoom.referencePhotos.length));
+  session.mappingRoom = normalizeMappingRoom(session.mappingRoom);
+  broadcastSession();
+  return serializeSession();
+});
+
+ipcMain.handle('session:update-mapping-room-reference-photo', (_event, id, patch) => {
+  if (!id || !patch || typeof patch !== 'object') return serializeSession();
+  session.mappingRoom.referencePhotos = session.mappingRoom.referencePhotos.map((photo, index) => (
+    photo.id === id ? normalizeReferencePhoto({ ...photo, ...patch }, index) : photo
+  ));
+  session.mappingRoom = normalizeMappingRoom(session.mappingRoom);
+  broadcastSession();
+  return serializeSession();
+});
+
+ipcMain.handle('session:remove-mapping-room-reference-photo', (_event, id) => {
+  if (!id) return serializeSession();
+  session.mappingRoom.referencePhotos = session.mappingRoom.referencePhotos.filter((photo) => photo.id !== id);
+  session.mappingRoom = normalizeMappingRoom(session.mappingRoom);
+  broadcastSession();
+  return serializeSession();
+});
+
 ipcMain.handle('session:set-output-mapping', (_event, slot, cameraId) => {
   if (!['left', 'front', 'right', 'ceiling'].includes(slot)) return serializeSession();
   const exists = session.sceneBuilder.cameras.some((camera) => camera.id === cameraId);
@@ -884,13 +1319,14 @@ ipcMain.handle('session:update-scene-settings', (_event, patch) => {
     }
     if (patch.overview !== undefined) session.sceneBuilder.mainView.overview = !!patch.overview;
     if (patch.worldMode && ['single', 'depth', 'test'].includes(patch.worldMode)) session.sceneBuilder.depthMode = patch.worldMode;
+    if (patch.surface && !['live', 'scene', 'mapping-room'].includes(patch.surface)) session.sceneSettings.surface = 'live';
     broadcastSession();
   }
   return serializeSession();
 });
 
 ipcMain.handle('session:apply-preset', (_event, preset) => {
-  if (!preset || preset.version !== 1 || !Array.isArray(preset.cameras)) return serializeSession();
+  if (!preset || ![1, 2].includes(Number(preset.version)) || !Array.isArray(preset.cameras)) return serializeSession();
   session.sceneBuilder = normalizeSceneBuilder({
     cameras: preset.cameras,
     selectedCameraId: preset.selectedCameraId || preset.cameras[0]?.id,
@@ -901,6 +1337,7 @@ ipcMain.handle('session:apply-preset', (_event, preset) => {
       pos: preset.main?.pos || [0, 0, 0]
     }
   });
+  session.mappingRoom = normalizeMappingRoom(preset.mappingRoom || session.mappingRoom);
   session.outputMappings = { ...defaultOutputMappings(), ...(preset.outputMappings || {}) };
   session.layoutMode = preset.layoutMode === 'ceiling' ? 'ceiling' : 'three-wall';
   session.sceneSettings = { ...session.sceneSettings, ...(preset.sceneSettings || {}) };

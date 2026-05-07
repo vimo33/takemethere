@@ -1,5 +1,5 @@
 import { AudioEngine } from './audio-engine.js';
-import { DEFAULT_PROJECTORS, SphereWorldRenderer, SphereWorldSceneBuilder, normalizeProjectors, normalizeSceneCameras, colorToCss } from './scene-engine.js';
+import { DEFAULT_PROJECTORS, MappingRoomRenderer, SphereWorldRenderer, SphereWorldSceneBuilder, normalizeProjectors, normalizeSceneCameras, colorToCss } from './scene-engine.js';
 
 const api = window.takeMeThere;
 const audio = new AudioEngine();
@@ -26,8 +26,10 @@ let renderers = [];
 let audioTimer = null;
 let audioTick = 0;
 let fileInput = null;
+let mappingPhotoInput = null;
 let renderSignature = '';
 let generationInFlight = false;
+let selectedMappingObjectId = 'wall-front';
 
 root.innerHTML = `
   <div class="shell scanlines">
@@ -126,9 +128,38 @@ function renderTopbar() {
       <div class="segmented">
         <button class="${surface === 'live' ? 'active' : ''}" data-action="surface" data-surface="live">Live</button>
         <button class="${surface === 'scene' ? 'active' : ''}" data-action="surface" data-surface="scene">Scene Builder</button>
+        <button class="${surface === 'mapping-room' ? 'active' : ''}" data-action="surface" data-surface="mapping-room">Mapping Room</button>
       </div>
     </div>
   `;
+}
+
+function surfaceMarkup() {
+  if (surface === 'scene') return sceneBuilderMarkup();
+  if (surface === 'mapping-room') return mappingRoomMarkup();
+  return liveConsoleMarkup();
+}
+
+function mappingRoomSignature(mappingRoom = {}) {
+  const items = [
+    ...(mappingRoom.surfaces || []),
+    ...(mappingRoom.objects || []),
+    ...(mappingRoom.masks || [])
+  ];
+  const photos = mappingRoom.referencePhotos || [];
+  return [
+    mappingRoom.selectedObjectId || '',
+    mappingRoom.showProjectors === false ? 'hide-projectors' : 'show-projectors',
+    items.map((item) => [
+      item.id,
+      item.label,
+      item.shape,
+      item.role,
+      item.materialMode,
+      item.visible === false ? 0 : 1
+    ].join(',')).join('|'),
+    photos.map((photo) => `${photo.id}:${photo.label}:${photo.visible === false ? 0 : 1}:${photo.opacity}:${photo.dataUrl?.length || 0}`).join('|')
+  ].join('::');
 }
 
 function getRenderSignature() {
@@ -152,6 +183,7 @@ function getRenderSignature() {
     session?.ndi?.running ? 'ndi-running' : `ndi-${session?.ndi?.error || 'idle'}`,
     session?.sceneBuilder?.selectedCameraId || '',
     session?.sceneBuilder?.depthMode || 'single',
+    mappingRoomSignature(session?.mappingRoom),
     JSON.stringify(session?.outputMappings || {}),
     sceneCameras.map((camera) => `${camera.id}:${camera.label}:${camera.signal}:${camera.live ? 1 : 0}:${camera.outputSlot}:${camera.orientation}:${camera.color}`).join('|'),
     projectors.map((projector) => `${projector.id}:${projector.live ? 1 : 0}:${projector.signal}`).join('|')
@@ -169,13 +201,23 @@ function render(force = false) {
   }
   renderSignature = nextSignature;
   disposeRenderers();
-  surfaceRoot.innerHTML = surface === 'scene' ? sceneBuilderMarkup() : liveConsoleMarkup();
+  surfaceRoot.innerHTML = surfaceMarkup();
   hydrateCanvases();
   startAudioBars();
 }
 
 function updateSceneRenderers() {
   for (const renderer of renderers) {
+    if (renderer instanceof MappingRoomRenderer) {
+      renderer.updateConfig({
+        mappingRoom: session.mappingRoom,
+        projectors: session.sceneBuilder?.cameras || session.projectors,
+        onMappingRoomChange: (patch) => api.updateMappingRoom(patch),
+        onObjectChange: (id, patch) => api.updateMappingRoomItem(id, patch),
+        onSelectObject: (id) => api.updateMappingRoom({ selectedObjectId: id })
+      });
+      continue;
+    }
     if (renderer instanceof SphereWorldSceneBuilder) {
       renderer.updateConfig({
         cameras: session.sceneBuilder?.cameras,
@@ -205,9 +247,23 @@ function updateSceneRenderers() {
   }
 }
 
+function mappingItems(mappingRoom = session?.mappingRoom || {}) {
+  return [
+    ...(mappingRoom.surfaces || []),
+    ...(mappingRoom.objects || []),
+    ...(mappingRoom.masks || [])
+  ];
+}
+
+function selectedMappingItem() {
+  const selectedId = session?.mappingRoom?.selectedObjectId || selectedMappingObjectId;
+  return mappingItems().find((item) => item.id === selectedId) || mappingItems()[0] || null;
+}
+
 function updateControlReadouts() {
   const projectors = new Map(normalizeProjectors(session.projectors, session.layoutMode).map((projector) => [projector.id, projector]));
   const cameras = new Map(normalizeSceneCameras(session.sceneBuilder?.cameras).map((camera) => [camera.id, camera]));
+  const mapping = new Map(mappingItems().map((item) => [item.id, item]));
   for (const input of surfaceRoot.querySelectorAll('[data-slider-kind="projector"]')) {
     const projector = projectors.get(input.dataset.id);
     if (!projector || document.activeElement === input) continue;
@@ -223,6 +279,12 @@ function updateControlReadouts() {
   for (const input of surfaceRoot.querySelectorAll('[data-slider-kind="setting"]')) {
     if (document.activeElement === input) continue;
     input.value = session.sceneSettings?.[input.dataset.key] ?? input.value;
+    updateSliderDisplay(input);
+  }
+  for (const input of surfaceRoot.querySelectorAll('[data-slider-kind="mapping"]')) {
+    const item = mapping.get(input.dataset.id);
+    if (!item || document.activeElement === input) continue;
+    input.value = item[input.dataset.key];
     updateSliderDisplay(input);
   }
   for (const toggle of surfaceRoot.querySelectorAll('[data-action="projector-toggle"]')) {
@@ -264,12 +326,7 @@ function liveConsoleMarkup() {
         </div>
         <div class="panel-section scroll" style="flex:1">
           <div class="section-title"><span>Session History</span><span>${(session.history || []).length} ENTR.</span></div>
-          ${(session.history || []).map((item) => `
-            <div class="well history-item">
-              <div class="history-line"><strong class="mono">${escapeHtml(item.title || 'World')}</strong><span class="mono dim">${escapeHtml((item.at || '').slice(11, 19) || item.ts || '')}</span></div>
-              <div class="history-line" style="margin-top:5px"><span class="mono ${item.event?.includes('fallback') ? 'signal-amber' : ''}">${escapeHtml(item.event || item.state || 'ARRIVAL_OK')}</span><span class="mono dim">${fmtMs(item.timings?.imageMs || item.imageMs)}</span><span class="mono dim">$${Number(item.costEstimateUsd || item.cost || 0).toFixed(2)}</span></div>
-            </div>
-          `).join('') || '<div class="well dim mono">No prior worlds.</div>'}
+          ${sessionHistoryMarkup()}
         </div>
       </aside>
 
@@ -351,6 +408,38 @@ function generatedWorldsMarkup() {
       </div>
     </div>
   `;
+}
+
+function sessionHistoryMarkup() {
+  const history = session.history || [];
+  if (!history.length) return '<div class="well dim mono">No prior worlds.</div>';
+  return history.map((item) => {
+    const loadable = !!item.loadable && item.historyIndex !== undefined && item.historyIndex !== null;
+    const tag = loadable ? 'button' : 'div';
+    const action = loadable ? `data-action="load-history" data-history-index="${escapeHtml(item.historyIndex)}"` : '';
+    const status = loadable ? 'RESTORE' : 'NO IMAGE';
+    const statusClass = loadable ? 'restore' : 'missing';
+    const when = item.at ? new Date(item.at) : null;
+    const clock = Number.isNaN(when?.getTime?.()) ? (item.ts || '') : when.toLocaleString([], { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+    const provider = item.worldName || item.provider?.image || item.provider?.prompt || 'history';
+    return `
+      <${tag} class="well history-item ${statusClass}" ${action}>
+        <div class="history-line">
+          <strong class="mono">${escapeHtml(item.title || 'World')}</strong>
+          <span class="mono history-status ${statusClass}">${status}</span>
+        </div>
+        <div class="history-line" style="margin-top:5px">
+          <span class="mono ${item.event?.includes('fallback') ? 'history-warning' : ''}">${escapeHtml(item.event || item.state || 'ARRIVAL_OK')}</span>
+          <span class="mono dim">${escapeHtml(clock)}</span>
+        </div>
+        <div class="history-line" style="margin-top:5px">
+          <span class="mono dim history-file">${escapeHtml(provider)}</span>
+          <span class="mono dim">${fmtMs(item.timings?.imageMs || item.imageMs)}</span>
+          <span class="mono dim">$${Number(item.costEstimateUsd || item.cost || 0).toFixed(2)}</span>
+        </div>
+      </${tag}>
+    `;
+  }).join('');
 }
 
 function promptOverlayMarkup() {
@@ -515,6 +604,137 @@ function cameraControlsMarkup(projector) {
   `;
 }
 
+function mappingItemRow(item) {
+  const selected = (session.mappingRoom?.selectedObjectId || selectedMappingObjectId) === item.id;
+  return `
+    <button class="projector-row mapping-row ${selected ? 'active' : ''}" data-action="select-mapping" data-id="${escapeHtml(item.id)}">
+      <span class="led" style="background:${colorToCss(item.color)};box-shadow:0 0 8px ${colorToCss(item.color, .7)}"></span>
+      <span><strong>${escapeHtml(item.label)}</strong><span class="mono dim" style="display:block;font-size:9px;margin-top:2px">${escapeHtml(item.role)} &middot; ${escapeHtml(item.shape)} &middot; ${escapeHtml(item.materialMode)}</span></span>
+      <span class="led ${item.visible === false ? '' : 'green'}"></span>
+    </button>
+  `;
+}
+
+function mappingRoomMarkup() {
+  const mappingRoom = session.mappingRoom || {};
+  const selected = selectedMappingItem();
+  const surfaces = mappingRoom.surfaces || [];
+  const objects = mappingRoom.objects || [];
+  const masks = mappingRoom.masks || [];
+  const photos = mappingRoom.referencePhotos || [];
+  const worldLabel = session.imageDataUrl ? (session.recipe?.title || 'Generated World') : 'Fallback Texture';
+  return `
+    <div class="main mapping-room-main">
+      <aside class="left-rail">
+        <div class="panel-header"><h3>Mapping Room</h3><span class="badge">${escapeHtml(mappingRoom.captureMode || 'manual-photo')}</span></div>
+        <div class="panel-section scroll" style="flex:1">
+          <div class="section-title"><span>Room Surfaces</span><span>${surfaces.length}</span></div>
+          ${surfaces.map(mappingItemRow).join('')}
+          <div class="section-title" style="margin-top:14px"><span>Projection Objects</span><span>${objects.length}</span></div>
+          ${objects.map(mappingItemRow).join('') || '<div class="well dim mono">No added objects yet.</div>'}
+          <div class="section-title" style="margin-top:14px"><span>Masks</span><span>${masks.length}</span></div>
+          ${masks.map(mappingItemRow).join('') || '<div class="well dim mono">No masks yet.</div>'}
+        </div>
+        <div class="panel-section">
+          <div class="section-title"><span>Add Geometry</span><span>Planning</span></div>
+          <div class="mapping-add-grid">
+            <button class="btn sm" data-action="add-mapping-item" data-shape="plane">Plane</button>
+            <button class="btn sm" data-action="add-mapping-item" data-shape="box">Box</button>
+            <button class="btn sm" data-action="add-mapping-item" data-shape="cylinder">Cylinder</button>
+            <button class="btn sm ghost" data-action="add-mapping-item" data-shape="frame">Door Frame</button>
+            <button class="btn sm ghost" data-action="add-mapping-item" data-shape="mask">Mask Plane</button>
+            <button class="btn sm ghost" data-action="mapping-add-photo">Photo</button>
+          </div>
+        </div>
+      </aside>
+
+      <section class="viewport-cell">
+        <canvas class="viewport-canvas" data-mapping-room></canvas>
+        <div class="viewport-overlay" style="top:0;left:0"><div class="viewport-corner mono"><span style="color:var(--signal-cyan)">MAPPING ROOM</span><div class="dim" style="font-size:9px;margin-top:2px">separate Three.js canvas &middot; live output unchanged</div></div></div>
+        <div class="viewport-overlay" style="top:0;right:0;text-align:right"><div class="viewport-corner mono">TEXTURE <span>${escapeHtml(worldLabel).toUpperCase()}</span><div class="dim" style="font-size:9px;margin-top:2px">${mappingRoom.showProjectors === false ? 'PROJECTOR GUIDES HIDDEN' : 'PROJECTOR GUIDES VISIBLE'}</div></div></div>
+        <div class="viewport-overlay" style="bottom:12px;right:12px;pointer-events:auto">
+          <button class="btn sm ${mappingRoom.showProjectors === false ? '' : 'primary'}" data-action="mapping-show-projectors">${mappingRoom.showProjectors === false ? 'Show Projectors' : 'Hide Projectors'}</button>
+          <button class="btn sm" data-action="mapping-reset-view">Reset View</button>
+        </div>
+      </section>
+
+      <aside class="right-bay">
+        <div class="panel-header"><h3>Surface Controls</h3><span class="badge">${escapeHtml(selected?.label || 'Nothing selected')}</span></div>
+        <div class="panel-section scroll" style="flex:1">
+          ${selected ? mappingControlsMarkup(selected) : '<div class="well dim mono">Select a wall, object, or mask.</div>'}
+        </div>
+      </aside>
+
+      <section class="bottom-pipeline">
+        <div class="panel-header"><h3>Reference Photos</h3><span class="badge">${photos.length} PLANNING LAYERS</span></div>
+        <div class="mapping-photo-strip">
+          ${photos.map((photo) => `
+            <div class="mapping-photo-card ${photo.visible === false ? 'muted' : ''}">
+              <div class="history-line"><strong class="mono">${escapeHtml(photo.label)}</strong><span class="mono dim">${Math.round(Number(photo.opacity ?? 0.42) * 100)}%</span></div>
+              <div class="history-line" style="margin-top:8px">
+                <button class="btn sm ghost" data-action="mapping-photo-visible" data-id="${escapeHtml(photo.id)}">${photo.visible === false ? 'Show' : 'Hide'}</button>
+                <button class="btn sm ghost" data-action="remove-mapping-photo" data-id="${escapeHtml(photo.id)}">Remove</button>
+              </div>
+            </div>
+          `).join('') || '<div class="well dim mono">Add room photos as manual planning references.</div>'}
+        </div>
+      </section>
+
+      <footer class="transport scene-transport">
+        <div class="transport-zone"><button class="btn ghost" data-action="surface" data-surface="scene">Scene Builder</button></div>
+        <div class="transport-zone" style="justify-content:center">
+          <div class="stage-cell">
+            <div class="stage-head"><span class="index">M</span><span class="name">Mapping workspace only</span></div>
+          </div>
+          <button class="btn ghost" data-action="load-preset">Load Preset</button>
+          <button class="btn" data-action="save-preset">Save Preset</button>
+          <button class="btn primary" data-action="focus-output">Focus Output</button>
+        </div>
+        <div class="transport-zone"><span class="mono dim" style="font-size:10px">NDI and MadMapper routing stay unchanged.</span></div>
+      </footer>
+    </div>
+  `;
+}
+
+function mappingControlsMarkup(item) {
+  const materialOptions = ['world', 'test', 'mask', 'transparent', 'solid'];
+  const removable = item.role !== 'surface';
+  return `
+    <div class="panel-section" style="padding-left:0;padding-right:0">
+      <div class="section-title"><span>Identity</span><span>${escapeHtml(item.role).toUpperCase()}</span></div>
+      <input type="text" value="${escapeHtml(item.label)}" data-mapping-text="${escapeHtml(item.id)}" data-key="label" />
+      <div class="mapping-inline">
+        <button class="toggle ${item.visible === false ? '' : 'on'}" data-action="mapping-visible" data-id="${escapeHtml(item.id)}" title="Visible"></button>
+        <select data-action="mapping-material" data-id="${escapeHtml(item.id)}">
+          ${materialOptions.map((mode) => `<option value="${mode}" ${item.materialMode === mode ? 'selected' : ''}>${mode}</option>`).join('')}
+        </select>
+        <button class="btn sm ghost" data-action="remove-mapping-item" data-id="${escapeHtml(item.id)}" ${removable ? '' : 'disabled'}>${removable ? 'Remove' : 'Keep'}</button>
+      </div>
+    </div>
+    <div class="panel-section" style="padding-left:0;padding-right:0">
+      <div class="section-title"><span>Position</span></div>
+      ${sliderMarkup('X', 'x', item.x, -700, 700, 1, `${Math.round(item.x)}`, 'mapping', item.id)}
+      ${sliderMarkup('Y', 'y', item.y, -100, 500, 1, `${Math.round(item.y)}`, 'mapping', item.id)}
+      ${sliderMarkup('Z', 'z', item.z, -700, 700, 1, `${Math.round(item.z)}`, 'mapping', item.id)}
+    </div>
+    <div class="panel-section" style="padding-left:0;padding-right:0">
+      <div class="section-title"><span>Rotation</span></div>
+      ${sliderMarkup('Rot X', 'rotX', item.rotX, -Math.PI, Math.PI, 0.005, `${(item.rotX * 180 / Math.PI).toFixed(1)} deg`, 'mapping', item.id)}
+      ${sliderMarkup('Rot Y', 'rotY', item.rotY, -Math.PI, Math.PI, 0.005, `${(item.rotY * 180 / Math.PI).toFixed(1)} deg`, 'mapping', item.id)}
+      ${sliderMarkup('Rot Z', 'rotZ', item.rotZ, -Math.PI, Math.PI, 0.005, `${(item.rotZ * 180 / Math.PI).toFixed(1)} deg`, 'mapping', item.id)}
+    </div>
+    <div class="panel-section" style="padding-left:0;padding-right:0">
+      <div class="section-title"><span>Shape</span><span>${escapeHtml(item.shape).toUpperCase()}</span></div>
+      ${sliderMarkup('Width', 'width', item.width, 2, 900, 1, `${Math.round(item.width)}`, 'mapping', item.id)}
+      ${sliderMarkup('Height', 'height', item.height, 2, 500, 1, `${Math.round(item.height)}`, 'mapping', item.id)}
+      ${sliderMarkup('Depth', 'depth', item.depth, 1, 500, 1, `${Math.round(item.depth)}`, 'mapping', item.id)}
+      ${item.shape === 'cylinder' ? sliderMarkup('Radius', 'radius', item.radius, 1, 280, 1, `${Math.round(item.radius)}`, 'mapping', item.id) : ''}
+      ${sliderMarkup('Opacity', 'opacity', item.opacity, 0, 1, 0.01, `${Math.round(item.opacity * 100)}%`, 'mapping', item.id)}
+      ${sliderMarkup('Feather', 'feather', item.feather, 0, 1, 0.01, `${Math.round(item.feather * 100)}%`, 'mapping', item.id)}
+    </div>
+  `;
+}
+
 function knobMarkup(label, value, rot) {
   const pos = Math.max(0, Math.min(270, 135 + rot));
   return `<div class="knob-row"><div class="knob" style="--knob-pos:${pos}deg"></div><div class="label">${label}</div><div class="value">${value}</div></div>`;
@@ -530,13 +750,31 @@ function updateSliderDisplay(input) {
   const key = input.dataset.key;
   const value = Number(input.value);
   if (key === 'yaw' || key === 'pitch') valueNode.textContent = `${(value * 180 / Math.PI).toFixed(1)}°`;
+  else if (key === 'rotX' || key === 'rotY' || key === 'rotZ') valueNode.textContent = `${(value * 180 / Math.PI).toFixed(1)} deg`;
   else if (key === 'fov') valueNode.textContent = `${Math.round(value)}°`;
-  else if (['intensity', 'particles'].includes(key)) valueNode.textContent = `${Math.round(value * 100)}%`;
+  else if (['intensity', 'particles', 'opacity', 'feather'].includes(key)) valueNode.textContent = `${Math.round(value * 100)}%`;
   else if (key === 'fog' || key === 'drift') valueNode.textContent = value.toFixed(2);
   else valueNode.textContent = `${Math.round(value)}`;
 }
 
 function hydrateCanvases() {
+  const mappingCanvas = document.querySelector('[data-mapping-room]');
+  if (mappingCanvas) {
+    const renderer = new MappingRoomRenderer(mappingCanvas, {
+      host: mappingCanvas.parentElement,
+      onMappingRoomChange: (patch) => api.updateMappingRoom(patch),
+      onObjectChange: (id, patch) => api.updateMappingRoomItem(id, patch),
+      onSelectObject: (id) => api.updateMappingRoom({ selectedObjectId: id })
+    });
+    renderer.updateConfig({
+      mappingRoom: session.mappingRoom,
+      projectors: session.sceneBuilder?.cameras || session.projectors
+    });
+    renderer.setImageDataUrl(session.imageDataUrl, session.recipe?.palette, session.history?.length || 1);
+    renderers.push(renderer);
+    return;
+  }
+
   const mainCanvas = document.querySelector('[data-scene-main]');
   if (mainCanvas) {
     if (surface === 'scene') {
@@ -619,7 +857,7 @@ function startSpeechRecognition() {
 
 function savePreset() {
   const preset = {
-    version: 1,
+    version: 2,
     depth: session.sceneBuilder?.depthMode === 'depth',
     depthMode: session.sceneBuilder?.depthMode || 'single',
     overview: !!session.sceneBuilder?.mainView?.overview,
@@ -627,7 +865,8 @@ function savePreset() {
     sceneSettings: session.sceneSettings,
     main: session.sceneBuilder?.mainView || { fov: session.sceneSettings?.mainFov || 75, yaw: 0, pitch: 0, pos: [0, 0, 0] },
     cameras: session.sceneBuilder?.cameras || session.projectors,
-    outputMappings: session.outputMappings || {}
+    outputMappings: session.outputMappings || {},
+    mappingRoom: session.mappingRoom || {}
   };
   const blob = new Blob([JSON.stringify(preset, null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
@@ -658,6 +897,31 @@ function loadPreset() {
   fileInput.click();
 }
 
+function addMappingReferencePhoto() {
+  if (!mappingPhotoInput) {
+    mappingPhotoInput = document.createElement('input');
+    mappingPhotoInput.type = 'file';
+    mappingPhotoInput.accept = 'image/*';
+    mappingPhotoInput.addEventListener('change', () => {
+      const file = mappingPhotoInput.files?.[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        api.addMappingRoomReferencePhoto({
+          label: file.name,
+          dataUrl: String(reader.result || ''),
+          opacity: 0.42,
+          visible: true
+        });
+      };
+      reader.onerror = () => alert('Could not load the reference photo.');
+      reader.readAsDataURL(file);
+      mappingPhotoInput.value = '';
+    });
+  }
+  mappingPhotoInput.click();
+}
+
 surfaceRoot.addEventListener('input', (event) => {
   const target = event.target;
   if (target.id === 'prompt-input') {
@@ -673,10 +937,15 @@ surfaceRoot.addEventListener('input', (event) => {
   } else if (target.dataset.sliderKind === 'camera') {
     updateSliderDisplay(target);
     api.updateSceneCamera(target.dataset.id, { [target.dataset.key]: Number(target.value) });
+  } else if (target.dataset.sliderKind === 'mapping') {
+    updateSliderDisplay(target);
+    api.updateMappingRoomItem(target.dataset.id, { [target.dataset.key]: Number(target.value) });
   } else if (target.dataset.projectorText) {
     api.updateProjector(target.dataset.projectorText, { [target.dataset.key]: target.value });
   } else if (target.dataset.cameraText) {
     api.updateSceneCamera(target.dataset.cameraText, { [target.dataset.key]: target.value });
+  } else if (target.dataset.mappingText) {
+    api.updateMappingRoomItem(target.dataset.mappingText, { [target.dataset.key]: target.value });
   } else if (target.dataset.action === 'test-select') {
     api.updateSceneSettings({ testPattern: target.value });
   } else if (target.dataset.action === 'output-map') {
@@ -690,12 +959,15 @@ surfaceRoot.addEventListener('change', (event) => {
     api.setOutputMapping(target.dataset.slot, target.value);
   } else if (target.dataset.action === 'test-select') {
     api.updateSceneSettings({ testPattern: target.value });
+  } else if (target.dataset.action === 'mapping-material') {
+    api.updateMappingRoomItem(target.dataset.id, { materialMode: target.value });
   }
 });
 
 surfaceRoot.addEventListener('click', async (event) => {
-  const button = event.target.closest('button, [data-projector-card]');
+  const button = event.target.closest('[data-action], [data-projector-card]');
   if (!button) return;
+  if (button.disabled || button.getAttribute('aria-disabled') === 'true') return;
   const action = button.dataset.action;
   if (!action && button.dataset.projectorCard) {
     selectedProjectorId = button.dataset.projectorCard;
@@ -712,6 +984,7 @@ surfaceRoot.addEventListener('click', async (event) => {
   else if (action === 'end') { await api.setState('EXIT'); setTimeout(() => api.setState('IDLE'), 1800); }
   else if (action === 'fallback') { missionStart ||= Date.now(); await api.fallbackWorld(promptValue); }
   else if (action === 'load-world') { missionStart ||= Date.now(); await api.loadGeneratedWorld(button.dataset.file); }
+  else if (action === 'load-history') { missionStart ||= Date.now(); await api.loadSessionHistoryEntry(button.dataset.historyIndex); }
   else if (action === 'blackout') { audio.mute(); await api.setState('BLACKOUT'); }
   else if (action === 'reset') {
     if (!resetArmed) {
@@ -740,8 +1013,29 @@ surfaceRoot.addEventListener('click', async (event) => {
   } else if (action === 'select-camera') {
     selectedProjectorId = button.dataset.id;
     await api.updateSceneBuilder({ selectedCameraId: selectedProjectorId });
+  } else if (action === 'select-mapping') {
+    selectedMappingObjectId = button.dataset.id;
+    await api.updateMappingRoom({ selectedObjectId: selectedMappingObjectId });
   } else if (action === 'add-camera') {
     await api.addSceneCamera();
+  } else if (action === 'add-mapping-item') {
+    await api.addMappingRoomItem(button.dataset.shape);
+  } else if (action === 'remove-mapping-item') {
+    await api.removeMappingRoomItem(button.dataset.id);
+  } else if (action === 'mapping-visible') {
+    const item = mappingItems().find((entry) => entry.id === button.dataset.id);
+    if (item) await api.updateMappingRoomItem(item.id, { visible: item.visible === false });
+  } else if (action === 'mapping-show-projectors') {
+    await api.updateMappingRoom({ showProjectors: session.mappingRoom?.showProjectors === false });
+  } else if (action === 'mapping-reset-view') {
+    await api.updateMappingRoom({ mainView: { pos: [0, 260, 620], target: [0, 110, -80], fov: 55 } });
+  } else if (action === 'mapping-add-photo') {
+    addMappingReferencePhoto();
+  } else if (action === 'mapping-photo-visible') {
+    const photo = session.mappingRoom?.referencePhotos?.find((item) => item.id === button.dataset.id);
+    if (photo) await api.updateMappingRoomReferencePhoto(photo.id, { visible: photo.visible === false });
+  } else if (action === 'remove-mapping-photo') {
+    await api.removeMappingRoomReferencePhoto(button.dataset.id);
   } else if (action === 'remove-camera') {
     await api.removeSceneCamera(button.dataset.id);
   } else if (action === 'camera-orientation') {
@@ -780,6 +1074,7 @@ api.onSessionUpdate((nextSession) => {
   session = nextSession;
   surface = nextSession.sceneSettings?.surface || surface;
   selectedProjectorId = surface === 'scene' ? (nextSession.sceneBuilder?.selectedCameraId || selectedProjectorId) : (nextSession.sceneSettings?.selectedProjectorId || selectedProjectorId);
+  selectedMappingObjectId = nextSession.mappingRoom?.selectedObjectId || selectedMappingObjectId;
   if (nextSession.transcript) promptValue = nextSession.transcript;
   if (previousState !== nextSession.state?.key) {
     if (['PORTAL_OPENING', 'ARRIVAL', 'WORLD_ACTIVE'].includes(nextSession.state?.key)) audio.start(nextSession.recipe?.sound_style || 'dream');
@@ -793,6 +1088,7 @@ api.getSession().then((initialSession) => {
   session = initialSession;
   surface = initialSession.sceneSettings?.surface || 'live';
   selectedProjectorId = surface === 'scene' ? (initialSession.sceneBuilder?.selectedCameraId || 'F') : (initialSession.sceneSettings?.selectedProjectorId || 'F');
+  selectedMappingObjectId = initialSession.mappingRoom?.selectedObjectId || 'wall-front';
   promptValue = initialSession.transcript || promptValue;
   render();
 });

@@ -18,6 +18,7 @@ const labels = document.querySelector('#labels');
 const blackout = document.querySelector('#blackout');
 let renderer = null;
 let lastImageDataUrl = '';
+let lastOutputRevision = -1;
 let lastTestKey = '';
 let lastLayoutKey = '';
 
@@ -64,11 +65,14 @@ function renderSession(session) {
     outputRenderer.setTestPattern(sceneSettings.testPattern || 'grid');
     lastTestKey = testKey;
     lastImageDataUrl = '';
+    lastOutputRevision = Number(session.outputRevision ?? lastOutputRevision);
     return;
   }
 
-  if (!testKey && (session.imageDataUrl !== lastImageDataUrl || lastTestKey)) {
+  const outputRevision = Number(session.outputRevision ?? 0);
+  if (!testKey && (session.imageDataUrl !== lastImageDataUrl || lastTestKey || outputRevision !== lastOutputRevision)) {
     lastImageDataUrl = session.imageDataUrl || '';
+    lastOutputRevision = outputRevision;
     lastTestKey = '';
     outputRenderer.setImageDataUrl(session.imageDataUrl, session.recipe?.palette, session.history?.length || 1);
   }

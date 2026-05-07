@@ -13,12 +13,14 @@
     "spout:capture": "scripts\\start-spout-captures.bat",
     "ndi:preflight": "node scripts/check-ndi-build.cjs",
     "ndi:configure": "node scripts/ndi-cmake.cjs configure",
-    "ndi:build": "node scripts/ndi-cmake.cjs build"
+    "ndi:build": "node scripts/ndi-cmake.cjs build",
+    "test:mapping-room": "node scripts/mapping-room.playwright.cjs"
   },
   "dependencies": {
     "three": "^0.181.2"
   },
   "devDependencies": {
-    "electron": "^36.9.5"
+    "electron": "^36.9.5",
+    "playwright": "^1.59.1"
   }
 }
